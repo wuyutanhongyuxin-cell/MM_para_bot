@@ -161,12 +161,17 @@ class SpreadCaptureBot:
 
     async def _on_bbo(self, channel, message: dict):
         """BBO update callback."""
-        data = message.get("params", {}).get("data", message.get("data", message))
+        try:
+            data = message.get("params", {}).get("data", message.get("data", message))
+        except AttributeError:
+            log.debug(f"BBO unexpected message type: {type(message)}")
+            return
         bid = float(data.get("bid", 0))
         ask = float(data.get("ask", 0))
         bid_size = float(data.get("bid_size", 0))
         ask_size = float(data.get("ask_size", 0))
 
+        log.debug(f"BBO update: bid={bid} ask={ask}")
         if bid > 0 and ask > 0 and ask > bid:
             self.market_state.update_bbo(bid, ask, bid_size, ask_size)
             self.quote_engine.update(
@@ -211,20 +216,15 @@ class SpreadCaptureBot:
 
         while self.running:
             try:
-                # Pump WS messages (non-blocking check)
-                try:
-                    await self.client.pump_ws()
-                except Exception:
-                    pass
-
-                # Wait for BBO update with timeout
+                # Wait for BBO update from WS callback (SDK auto-dispatches)
                 try:
                     await asyncio.wait_for(
                         self._bbo_event.wait(), timeout=5.0
                     )
                     self._bbo_event.clear()
                 except asyncio.TimeoutError:
-                    # No BBO in 5s — try REST
+                    # No BBO in 5s — try REST fallback
+                    log.debug("No BBO update in 5s, trying REST poll")
                     if self.market_state.age > 10:
                         await self._poll_bbo()
                     continue
@@ -295,9 +295,16 @@ class SpreadCaptureBot:
                 )
 
                 if quotes.skip_reason:
-                    log.debug(f"Quote skipped: {quotes.skip_reason}")
+                    log.info(f"Quote skipped: {quotes.skip_reason}")
                     await asyncio.sleep(1)
                     continue
+
+                log.info(
+                    f"[QUOTE] fair=${quotes.fair_price:.1f} "
+                    f"bid=${quotes.bid_price:.0f}x{quotes.bid_size:.4f} "
+                    f"ask=${quotes.ask_price:.0f}x{quotes.ask_size:.4f} "
+                    f"sigma={quotes.sigma:.2f} obi={quotes.obi:+.3f}"
+                )
 
                 # Update state for logging
                 self.bot_state.last_fair_price = quotes.fair_price
