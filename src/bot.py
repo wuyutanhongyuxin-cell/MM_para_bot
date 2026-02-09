@@ -211,7 +211,9 @@ class SpreadCaptureBot:
         if market and market != self.market_name:
             return
 
-        size = float(pos.get("size", 0))
+        # CRITICAL: Paradex API returns signed size (negative for SHORT).
+        # Always abs() before applying sign from side field to avoid double-negation.
+        size = abs(float(pos.get("size", 0)))
         side = pos.get("side", "")
         old_pos = self.bot_state.net_position
 
@@ -224,7 +226,7 @@ class SpreadCaptureBot:
 
         new_pos = self.bot_state.net_position
         if abs(new_pos - old_pos) > 0.00005:
-            log.debug(f"[POS-WS] {side} {size:.4f} -> net={new_pos:+.4f} (was {old_pos:+.4f})")
+            log.info(f"[POS-WS] {side} {size:.4f} -> net={new_pos:+.4f} (was {old_pos:+.4f})")
 
         # Update avg_entry from exchange if available
         avg_entry = pos.get("average_entry_price")
@@ -481,14 +483,14 @@ class SpreadCaptureBot:
             positions = await self.client.get_positions()
             btc_pos = [p for p in positions if p.get("market") == self.market_name]
 
-            if not btc_pos or float(btc_pos[0].get("size", 0)) < 0.00005:
+            if not btc_pos or abs(float(btc_pos[0].get("size", 0))) < 0.00005:
                 log.info("[EMERGENCY EXIT] No position on exchange, syncing local state")
                 self.bot_state.net_position = 0.0
                 self.bot_state.position_entry_time = 0
                 self.bot_state.tighten_mode = False
                 return
 
-            real_size = float(btc_pos[0]["size"])
+            real_size = abs(float(btc_pos[0]["size"]))
             real_side = btc_pos[0].get("side", "")
             close_side = "SELL" if real_side == "LONG" else "BUY"
 
@@ -534,13 +536,13 @@ class SpreadCaptureBot:
                 await asyncio.sleep(1)
                 positions2 = await self.client.get_positions()
                 btc_pos2 = [p for p in positions2 if p.get("market") == self.market_name]
-                if not btc_pos2 or float(btc_pos2[0].get("size", 0)) < 0.00005:
+                if not btc_pos2 or abs(float(btc_pos2[0].get("size", 0))) < 0.00005:
                     log.info("[EMERGENCY EXIT] Position confirmed closed")
                     self.bot_state.net_position = 0.0
                     self.bot_state.position_entry_time = 0
                     self.bot_state.tighten_mode = False
                 else:
-                    remaining = float(btc_pos2[0].get("size", 0))
+                    remaining = abs(float(btc_pos2[0].get("size", 0)))
                     log.error(f"[EMERGENCY EXIT] Position still open: {remaining:.4f} BTC")
             else:
                 log.error("[EMERGENCY EXIT] Failed to send exit order!")
@@ -678,7 +680,7 @@ class SpreadCaptureBot:
 
             if btc_pos:
                 pos = btc_pos[0]
-                rest_size = float(pos.get("size", 0))
+                rest_size = abs(float(pos.get("size", 0)))
                 rest_side = pos.get("side", "NONE")
                 rest_net = rest_size if rest_side == "LONG" else (
                     -rest_size if rest_side == "SHORT" else 0.0
@@ -757,7 +759,7 @@ class SpreadCaptureBot:
         btc_pos = [p for p in positions if p.get("market") == self.market_name]
         if btc_pos:
             pos = btc_pos[0]
-            size = float(pos.get("size", 0))
+            size = abs(float(pos.get("size", 0)))
             side = pos.get("side", "NONE")
             log.info(f"  Position: {side} {size:.4f} BTC")
             if side == "LONG":
@@ -808,8 +810,8 @@ class SpreadCaptureBot:
             positions = await self.client.get_positions()
             btc_pos = [p for p in positions if p.get("market") == self.market_name]
 
-            if btc_pos and float(btc_pos[0].get("size", 0)) > 0.00005:
-                real_size = float(btc_pos[0]["size"])
+            if btc_pos and abs(float(btc_pos[0].get("size", 0))) > 0.00005:
+                real_size = abs(float(btc_pos[0]["size"]))
                 real_side = btc_pos[0].get("side", "")
                 close_side = "SELL" if real_side == "LONG" else "BUY"
                 log.info(f"Closing position: {close_side} {real_size:.4f} BTC (from REST)")
@@ -832,10 +834,10 @@ class SpreadCaptureBot:
                         btc_pos2 = [
                             p for p in positions2
                             if p.get("market") == self.market_name
-                            and float(p.get("size", 0)) > 0.00005
+                            and abs(float(p.get("size", 0))) > 0.00005
                         ]
                         if btc_pos2:
-                            remaining = float(btc_pos2[0]["size"])
+                            remaining = abs(float(btc_pos2[0]["size"]))
                             remaining_side = btc_pos2[0].get("side", "")
                             remaining_close = "SELL" if remaining_side == "LONG" else "BUY"
                             log.info(f"Maker exit incomplete, IOC closing {remaining:.4f} BTC")
