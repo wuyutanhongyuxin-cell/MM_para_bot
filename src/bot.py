@@ -335,8 +335,8 @@ class SpreadCaptureBot:
                     await asyncio.sleep(0.1)
                     continue
 
-                # Check rate limit headroom (2 new orders per cycle)
-                if not self.risk_manager.can_place_orders(2):
+                # Check rate limit headroom (up to 4 ops per cycle: 2 cancel + 2 place)
+                if not self.risk_manager.can_place_orders(4):
                     log.debug("Not enough rate headroom for requote")
                     await asyncio.sleep(1)
                     continue
@@ -402,11 +402,11 @@ class SpreadCaptureBot:
                 quotes.ask_size = 0
 
         # Cancel existing bid if price changed or no longer needed
-        # Cancels do NOT count toward Paradex order rate limit (separate 300ms speed bump)
         if self.bot_state.open_bid_id:
             if (quotes.bid_size == 0 or
                     quotes.bid_price != self.bot_state.open_bid_price):
                 await self.client.cancel_order(self.bot_state.open_bid_id)
+                self.risk_manager.record_order()
                 self.bot_state.open_bid_id = None
                 self.bot_state.open_bid_price = 0.0
 
@@ -414,6 +414,7 @@ class SpreadCaptureBot:
             if (quotes.ask_size == 0 or
                     quotes.ask_price != self.bot_state.open_ask_price):
                 await self.client.cancel_order(self.bot_state.open_ask_id)
+                self.risk_manager.record_order()
                 self.bot_state.open_ask_id = None
                 self.bot_state.open_ask_price = 0.0
 
