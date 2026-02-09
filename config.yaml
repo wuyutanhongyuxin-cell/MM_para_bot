@@ -1,0 +1,55 @@
+# =============================================================================
+# Paradex BTC-USD-PERP Market Making Bot - Configuration
+# =============================================================================
+
+# ============ Platform Settings ============
+paradex:
+  env: "mainnet"                   # mainnet / testnet
+  market: "BTC-USD-PERP"
+  profile: "retail"                # retail (0% fee) / pro (batch orders)
+
+# ============ Core Market Making Parameters ============
+strategy:
+  gamma: 0.3                       # Risk aversion coefficient (0.1=aggressive, 0.5=conservative)
+  kappa: 1.5                       # Volatility sensitivity for spread (1.0-3.0)
+  min_half_spread: 1.0             # Minimum half-spread in $ (floor)
+  refresh_interval: 8.0            # Quote refresh interval (seconds)
+  base_size: 0.0003                # Base order size (BTC) - minimum on Paradex
+  max_position: 0.001              # Maximum net position (BTC)
+  vol_window: 60                   # Volatility calculation window (BBO tick count)
+  tick_size: 1.0                   # BTC-USD-PERP tick size ($1)
+
+# ============ OBI (Order Book Imbalance) Overlay ============
+obi:
+  enabled: true
+  alpha: 0.3                       # EMA smoothing factor (0=slow, 1=fast)
+  threshold: 0.3                   # Activation threshold: |obi| > threshold
+  delta: 0.3                       # Signal strength (fair_price offset magnitude)
+  depth: 5                         # Use top N levels of orderbook
+
+# ============ Risk Management ============
+risk:
+  max_loss_per_trade: 0.30         # Max loss per single trade ($)
+  max_loss_per_hour: 0.50          # Max hourly loss ($)
+  max_loss_per_day: 1.00           # Max daily loss ($)
+  inventory_timeout: 120           # Inventory soft timeout (sec) -> tighten spread
+  emergency_timeout: 300           # Inventory hard timeout (sec) -> IOC force close
+  max_unrealized_loss: 0.30        # Max unrealized loss to trigger emergency ($)
+
+# ============ Rate Limits (Retail Profile - with safety margin) ============
+rate_limit:
+  max_orders_per_second: 2         # Limit: 3/s, margin: 1
+  max_orders_per_minute: 25        # Limit: 30/min, margin: 5
+  max_orders_per_hour: 280         # Limit: 300/hr, margin: 20
+  max_orders_per_day: 950          # Limit: 1000/day, margin: 50
+
+# ============ Trading Schedule (UTC) ============
+schedule:
+  active_hours_utc: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  pause_hours_utc: [21, 22, 23, 0, 1, 2, 3, 4, 5]
+
+# ============ Logging ============
+logging:
+  level: "INFO"                    # DEBUG / INFO / WARNING / ERROR
+  trade_csv: "trades.csv"          # Trade log file path
+  console_interval: 30             # Status print interval (seconds)
