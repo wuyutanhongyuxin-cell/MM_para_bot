@@ -283,8 +283,8 @@ class SpreadCaptureBot:
                     await asyncio.sleep(0.1)
                     continue
 
-                # Check rate limit headroom for cancel+requote (up to 4 ops)
-                if not self.risk_manager.can_place_orders(4):
+                # Check rate limit headroom (2 new orders per cycle)
+                if not self.risk_manager.can_place_orders(2):
                     log.debug("Not enough rate headroom for requote")
                     await asyncio.sleep(1)
                     continue
