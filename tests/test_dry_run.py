@@ -135,8 +135,9 @@ class TestStateMachineTransitions:
     def test_idle_to_quoting(self):
         """From IDLE, generating quotes should produce bid+ask."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        t = time.time()
+        for i, p in enumerate([97501.0] * 20):
+            engine.mid_prices.append((t + i * 0.1, p))
 
         ms = MarketState()
         ms.update_bbo(97500.0, 97502.0)
@@ -177,8 +178,9 @@ class TestStateMachineTransitions:
     def test_long_inventory_skewed_quotes(self):
         """Long position should produce skewed quotes for exit."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        t = time.time()
+        for i, p in enumerate([97501.0] * 20):
+            engine.mid_prices.append((t + i * 0.1, p))
 
         ms = MarketState()
         ms.update_bbo(97500.0, 97502.0)
@@ -212,8 +214,9 @@ class TestDryRunSimulation:
         tracker = PnLTracker()
 
         # Seed volatility data
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        t = time.time()
+        for i, p in enumerate([97501.0] * 20):
+            engine.mid_prices.append((t + i * 0.1, p))
 
         ms = MarketState()
         ms.update_bbo(97500.0, 97502.0)

@@ -1,5 +1,6 @@
 """Tests for QuoteEngine: Avellaneda-Stoikov + OBI overlay."""
 
+import time
 import pytest
 from src.quote_engine import QuoteEngine
 from src.state import MarketState, BotState
@@ -48,6 +49,13 @@ def make_bot(net_position=0.0):
     return bs
 
 
+def seed_prices(engine, prices):
+    """Seed mid_prices with (timestamp, price) tuples."""
+    t = time.time()
+    for i, p in enumerate(prices):
+        engine.mid_prices.append((t + i * 0.1, p))
+
+
 class TestQuoteEngineBasics:
     """Basic quote generation tests."""
 
@@ -55,8 +63,7 @@ class TestQuoteEngineBasics:
         """With zero inventory, bid and ask should be symmetric around fair price."""
         engine = QuoteEngine(make_config())
         # Seed some mid prices for volatility
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market(97500.0, 97502.0)
         bs = make_bot(0.0)
@@ -73,8 +80,7 @@ class TestQuoteEngineBasics:
     def test_zero_inventory_equal_sizes(self):
         """With zero inventory, bid and ask sizes should be equal."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market()
         bs = make_bot(0.0)
@@ -98,8 +104,7 @@ class TestInventorySkewing:
     def test_long_inventory_ask_more_aggressive(self):
         """When long, ask should be closer to mid (more aggressive selling)."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market(97500.0, 97502.0)
 
@@ -117,8 +122,7 @@ class TestInventorySkewing:
     def test_short_inventory_bid_more_aggressive(self):
         """When short, bid should be closer to mid (more aggressive buying)."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market(97500.0, 97502.0)
 
@@ -136,8 +140,7 @@ class TestInventorySkewing:
     def test_long_position_reduces_bid_size(self):
         """When long, bid size should be reduced."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market()
         bs = make_bot(0.005)  # Half max position
@@ -148,8 +151,7 @@ class TestInventorySkewing:
     def test_short_position_reduces_ask_size(self):
         """When short, ask size should be reduced."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market()
         bs = make_bot(-0.005)
@@ -160,8 +162,7 @@ class TestInventorySkewing:
     def test_max_long_position_zero_bid(self):
         """At max long position, bid size should be 0 (stop buying)."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market()
         bs = make_bot(0.01)  # At max position
@@ -172,8 +173,7 @@ class TestInventorySkewing:
     def test_max_short_position_zero_ask(self):
         """At max short position, ask size should be 0 (stop selling)."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market()
         bs = make_bot(-0.01)
@@ -188,8 +188,7 @@ class TestOBIOverlay:
     def test_positive_obi_shifts_fair_down(self):
         """Positive OBI (buy pressure) should shift fair_price DOWN (contrarian)."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         # Strong buy pressure — call multiple times to build up EMA
         bids = [(97500 - i, 10.0) for i in range(5)]
@@ -210,8 +209,7 @@ class TestOBIOverlay:
     def test_negative_obi_shifts_fair_up(self):
         """Negative OBI (sell pressure) should shift fair_price UP (contrarian)."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         # Strong sell pressure — call multiple times to build up EMA
         bids = [(97500 - i, 1.0) for i in range(5)]
@@ -230,8 +228,7 @@ class TestOBIOverlay:
     def test_obi_below_threshold_no_shift(self):
         """OBI below threshold should not shift fair price."""
         engine = QuoteEngine(make_config(**{"obi.threshold": 0.3}))
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         # Balanced book
         bids = [(97500 - i, 5.0) for i in range(5)]
@@ -251,8 +248,7 @@ class TestOBIOverlay:
     def test_obi_disabled(self):
         """With OBI disabled, fair price should not be affected by order book."""
         engine = QuoteEngine(make_config(**{"obi.enabled": False}))
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         # Extreme imbalance
         bids = [(97500 - i, 100.0) for i in range(5)]
@@ -273,8 +269,7 @@ class TestTickAlignment:
     def test_bid_floor_to_tick(self):
         """Bid should be floored to tick size."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market()
         bs = make_bot()
@@ -286,8 +281,7 @@ class TestTickAlignment:
     def test_ask_ceil_to_tick(self):
         """Ask should be ceiled to tick size."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market()
         bs = make_bot()
@@ -302,8 +296,7 @@ class TestNoCrossingBBO:
     def test_bid_not_above_best_bid(self):
         """Our bid should never exceed the best bid."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market(97500.0, 97502.0)
         bs = make_bot()
@@ -314,8 +307,7 @@ class TestNoCrossingBBO:
     def test_ask_not_below_best_ask(self):
         """Our ask should never be below the best ask."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market(97500.0, 97502.0)
         bs = make_bot()
@@ -330,8 +322,7 @@ class TestVolatility:
     def test_low_volatility(self):
         """Stable prices should produce low volatility."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         sigma = engine.calc_volatility()
         assert sigma == 1.0  # Floor value
@@ -340,8 +331,7 @@ class TestVolatility:
         """Varying prices should produce higher volatility."""
         engine = QuoteEngine(make_config())
         # Oscillating prices
-        for i in range(20):
-            engine.mid_prices.append(97500 + (i % 2) * 10)
+        seed_prices(engine, [97500 + (i % 2) * 10 for i in range(20)])
 
         sigma = engine.calc_volatility()
         assert sigma > 1.0
@@ -349,8 +339,9 @@ class TestVolatility:
     def test_insufficient_data_default(self):
         """With < 10 samples, should return default volatility."""
         engine = QuoteEngine(make_config())
-        engine.mid_prices.append(97501.0)
-        engine.mid_prices.append(97502.0)
+        t = time.time()
+        engine.mid_prices.append((t, 97501.0))
+        engine.mid_prices.append((t + 1, 97502.0))
 
         sigma = engine.calc_volatility()
         assert sigma == 5.0  # Default
@@ -362,8 +353,7 @@ class TestSpreadWidening:
     def test_heavy_inventory_wider_spread(self):
         """Heavy inventory should produce wider spread than no inventory."""
         engine = QuoteEngine(make_config())
-        for p in [97501.0] * 20:
-            engine.mid_prices.append(p)
+        seed_prices(engine, [97501.0] * 20)
 
         ms = make_market()
 

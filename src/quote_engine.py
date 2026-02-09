@@ -11,6 +11,7 @@ Core algorithm:
 
 import logging
 import math
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Dict
@@ -58,8 +59,9 @@ class QuoteEngine:
         self.obi_delta = obi_cfg.get("delta", 0.3)
         self.obi_depth = obi_cfg.get("depth", 5)
 
-        # State
-        self.mid_prices: deque = deque(maxlen=self.vol_window)
+        # State — mid_prices stores (timestamp, price) tuples
+        self.mid_prices: deque = deque()
+        self.vol_time_window: float = float(self.vol_window)  # seconds
         self.obi_smooth: float = 0.0
         self._last_sigma: float = 5.0  # Default volatility
 
@@ -74,7 +76,12 @@ class QuoteEngine:
         ask = bbo.get("ask", 0)
         if bid > 0 and ask > 0:
             mid = (bid + ask) / 2.0
-            self.mid_prices.append(mid)
+            now = time.time()
+            self.mid_prices.append((now, mid))
+            # Prune entries older than time window
+            cutoff = now - self.vol_time_window
+            while self.mid_prices and self.mid_prices[0][0] < cutoff:
+                self.mid_prices.popleft()
 
         if orderbook and self.obi_enabled:
             bids = orderbook.get("bids", [])
@@ -85,13 +92,13 @@ class QuoteEngine:
     def calc_volatility(self) -> float:
         """Estimate sigma from mid price differences (standard deviation).
 
-        Returns annualized-ish volatility in $ terms, but for our purposes
-        we just need a relative measure scaled to the quote interval.
+        Uses time-windowed mid prices (default 60 seconds) to avoid
+        noise from ultra-high-frequency BBO updates.
         """
         if len(self.mid_prices) < 10:
             return self._last_sigma if self._last_sigma > 0 else 5.0
 
-        prices = list(self.mid_prices)
+        prices = [p for _, p in self.mid_prices]
         diffs = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
 
         if not diffs:
@@ -199,8 +206,27 @@ class QuoteEngine:
             ask_price = max(ask_price, best_ask)
 
         if bid_price >= ask_price:
-            result.skip_reason = "spread_too_tight"
-            return result
+            # When holding inventory, still quote the exit side
+            if net_pos > 0:
+                # Long — only quote ask (sell to exit)
+                result.ask_price = max(ask_price, best_ask)
+                result.ask_size = self.base_size
+                result.bid_price = 0
+                result.bid_size = 0
+                result.fair_price = fair_price
+                return result
+            elif net_pos < 0:
+                # Short — only quote bid (buy to exit)
+                result.bid_price = min(bid_price, best_bid)
+                result.bid_size = self.base_size
+                result.ask_price = 0
+                result.ask_size = 0
+                result.fair_price = fair_price
+                return result
+            else:
+                # No position — skip (no edge to capture)
+                result.skip_reason = "spread_too_tight"
+                return result
 
         result.bid_price = bid_price
         result.ask_price = ask_price

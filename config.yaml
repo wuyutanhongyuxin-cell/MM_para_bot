@@ -16,7 +16,7 @@ strategy:
   refresh_interval: 8.0            # Quote refresh interval (seconds)
   base_size: 0.0003                # Base order size (BTC) - minimum on Paradex
   max_position: 0.001              # Maximum net position (BTC)
-  vol_window: 60                   # Volatility calculation window (BBO tick count)
+  vol_window: 60                   # Volatility calculation window (seconds)
   tick_size: 1.0                   # BTC-USD-PERP tick size ($1)
 
 # ============ OBI (Order Book Imbalance) Overlay ============

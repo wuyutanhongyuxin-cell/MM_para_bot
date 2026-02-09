@@ -212,7 +212,9 @@ class SpreadCaptureBot:
         log.info("Main loop started")
         last_quote = 0.0
         last_orderbook_fetch = 0.0
-        orderbook_interval = 30.0  # Fetch orderbook every 30s for OBI
+        orderbook_interval = 10.0  # Fetch orderbook every 10s for OBI
+        last_reconcile = 0.0
+        reconcile_interval = 30.0  # REST position reconciliation every 30s
 
         while self.running:
             try:
@@ -238,6 +240,11 @@ class SpreadCaptureBot:
                 if time.time() - last_orderbook_fetch > orderbook_interval:
                     await self._fetch_orderbook()
                     last_orderbook_fetch = time.time()
+
+                # Periodic position reconciliation via REST
+                if time.time() - last_reconcile > reconcile_interval:
+                    await self._reconcile_position()
+                    last_reconcile = time.time()
 
                 # Risk check
                 can_trade, reason = self.risk_manager.can_trade()
@@ -339,14 +346,13 @@ class SpreadCaptureBot:
         orders_used = 0
 
         # Cancel existing bid if price changed or no longer needed
+        # Cancels do NOT count toward Paradex order rate limit (separate 300ms speed bump)
         if self.bot_state.open_bid_id:
             if (quotes.bid_size == 0 or
                     quotes.bid_price != self.bot_state.open_bid_price):
                 await self.client.cancel_order(self.bot_state.open_bid_id)
                 self.bot_state.open_bid_id = None
                 self.bot_state.open_bid_price = 0.0
-                self.risk_manager.record_order()
-                orders_used += 1
 
         if self.bot_state.open_ask_id:
             if (quotes.ask_size == 0 or
@@ -354,8 +360,6 @@ class SpreadCaptureBot:
                 await self.client.cancel_order(self.bot_state.open_ask_id)
                 self.bot_state.open_ask_id = None
                 self.bot_state.open_ask_price = 0.0
-                self.risk_manager.record_order()
-                orders_used += 1
 
         # Place new bid
         if quotes.bid_size > 0 and not self.bot_state.open_bid_id:
@@ -533,6 +537,44 @@ class SpreadCaptureBot:
             )
             self.quote_engine.update(bbo)
             self._bbo_event.set()
+
+    async def _reconcile_position(self):
+        """Reconcile local position state with REST API."""
+        try:
+            positions = await self.client.get_positions()
+            btc_pos = [p for p in positions if p.get("market") == self.market_name]
+
+            if btc_pos:
+                pos = btc_pos[0]
+                rest_size = float(pos.get("size", 0))
+                rest_side = pos.get("side", "NONE")
+                rest_net = rest_size if rest_side == "LONG" else (
+                    -rest_size if rest_side == "SHORT" else 0.0
+                )
+            else:
+                rest_net = 0.0
+
+            local_net = self.bot_state.net_position
+
+            if abs(rest_net - local_net) > 0.00005:
+                log.warning(
+                    f"[RECONCILE] Position mismatch! "
+                    f"local={local_net:+.4f} vs REST={rest_net:+.4f}. "
+                    f"Correcting to REST value."
+                )
+                self.bot_state.net_position = rest_net
+                if btc_pos:
+                    self.bot_state.avg_entry_price = float(
+                        btc_pos[0].get("average_entry_price", 0)
+                    )
+                if abs(rest_net) > 0.00005 and self.bot_state.position_entry_time == 0:
+                    self.bot_state.position_entry_time = time.time()
+                elif abs(rest_net) < 0.00005:
+                    self.bot_state.position_entry_time = 0
+            else:
+                log.debug(f"[RECONCILE] OK: pos={rest_net:+.4f}")
+        except Exception as e:
+            log.debug(f"[RECONCILE] Failed: {e}")
 
     async def _fetch_orderbook(self):
         """Fetch orderbook depth for OBI calculation."""
