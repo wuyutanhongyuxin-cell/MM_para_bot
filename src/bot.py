@@ -191,17 +191,52 @@ class SpreadCaptureBot:
         await self._handle_order_update(data)
 
     async def _on_position_update(self, channel, message: dict):
-        """Position update callback."""
+        """Position update callback — authoritative source of position truth."""
         data = message.get("params", {}).get("data", message.get("data", message))
+
+        # Handle list format: [{"market": ..., "side": ..., "size": ...}, ...]
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    self._apply_position_update(item)
+            return
+
         if isinstance(data, dict):
-            size = float(data.get("size", 0))
-            side = data.get("side", "")
-            if side == "SHORT":
-                self.bot_state.net_position = -size
-            elif side == "LONG":
-                self.bot_state.net_position = size
-            elif size == 0:
-                self.bot_state.net_position = 0
+            self._apply_position_update(data)
+
+    def _apply_position_update(self, pos: dict):
+        """Apply a single position update from WS."""
+        # Filter to our market
+        market = pos.get("market", "")
+        if market and market != self.market_name:
+            return
+
+        size = float(pos.get("size", 0))
+        side = pos.get("side", "")
+        old_pos = self.bot_state.net_position
+
+        if side == "SHORT":
+            self.bot_state.net_position = -size
+        elif side == "LONG":
+            self.bot_state.net_position = size
+        elif size == 0 or side in ("", "NONE"):
+            self.bot_state.net_position = 0.0
+
+        new_pos = self.bot_state.net_position
+        if abs(new_pos - old_pos) > 0.00005:
+            log.debug(f"[POS-WS] {side} {size:.4f} -> net={new_pos:+.4f} (was {old_pos:+.4f})")
+
+        # Update avg_entry from exchange if available
+        avg_entry = pos.get("average_entry_price")
+        if avg_entry:
+            self.bot_state.avg_entry_price = float(avg_entry)
+
+        # Track position entry time
+        if self.bot_state.has_position and self.bot_state.position_entry_time == 0:
+            self.bot_state.position_entry_time = time.time()
+        elif not self.bot_state.has_position:
+            self.bot_state.position_entry_time = 0
+            self.bot_state.tighten_mode = False
 
     # =========================================================================
     # Main Loop
@@ -214,7 +249,7 @@ class SpreadCaptureBot:
         last_orderbook_fetch = 0.0
         orderbook_interval = 10.0  # Fetch orderbook every 10s for OBI
         last_reconcile = 0.0
-        reconcile_interval = 30.0  # REST position reconciliation every 30s
+        reconcile_interval = 10.0  # REST position reconciliation every 10s
         last_timeout_log = 0.0
         timeout_log_interval = 30.0  # Debounce timeout log to 30s
 
@@ -530,24 +565,18 @@ class SpreadCaptureBot:
         is_maker = fill.get("liquidity", "").upper() == "MAKER"
         fill_type = "maker" if is_maker else "taker"
 
-        # Update PnL tracker
+        # Update PnL tracker (for PnL math only, NOT position authority)
         summary = self.pnl_tracker.on_fill(side, price, size)
 
-        # Update bot state
-        self.bot_state.net_position = summary["net_position"]
-        self.bot_state.avg_entry_price = summary["avg_entry"]
+        # DO NOT set net_position from PnLTracker — it tracks independently from
+        # zero and will conflict with the exchange-reported position from WS callback
+        # and REST reconciliation. Position authority is: WS _on_position_update + REST.
+        # Position entry time tracking is also handled by _apply_position_update.
         self.bot_state.total_trades += 1
         if is_maker:
             self.bot_state.maker_fills += 1
         else:
             self.bot_state.taker_fills += 1
-
-        # Track position entry time
-        if self.bot_state.has_position and self.bot_state.position_entry_time == 0:
-            self.bot_state.position_entry_time = time.time()
-        elif not self.bot_state.has_position:
-            self.bot_state.position_entry_time = 0
-            self.bot_state.tighten_mode = False
 
         # Update realized PnL
         self.bot_state.realized_pnl_session = summary["cumulative_pnl"]
@@ -581,11 +610,11 @@ class SpreadCaptureBot:
                 self.bot_state.open_ask_id = None
                 self.bot_state.open_ask_price = 0.0
 
-        # Log
+        # Log — show exchange position (bot_state), not PnLTracker position
         rpnl = summary["realized_pnl"]
         log.info(
             f"[FILL] {fill_type.upper()} {side} {size:.4f} @ ${price:.1f} | "
-            f"pos={summary['net_position']:+.4f} | "
+            f"pos={self.bot_state.net_position:+.4f} | "
             f"rPnL=${rpnl:+.4f} cumPnL=${summary['cumulative_pnl']:+.4f}"
         )
 
@@ -595,7 +624,7 @@ class SpreadCaptureBot:
             price=price,
             size=size,
             maker_taker=fill_type,
-            net_position=summary["net_position"],
+            net_position=self.bot_state.net_position,
             unrealized_pnl=self.bot_state.unrealized_pnl,
             realized_pnl=rpnl,
             obi=self.bot_state.last_obi,
