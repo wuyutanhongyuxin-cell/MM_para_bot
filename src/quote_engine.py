@@ -231,11 +231,30 @@ class QuoteEngine:
         result.bid_price = bid_price
         result.ask_price = ask_price
 
+        # Step 5.5: Tighten mode — after inventory timeout, place exit at BBO
+        if bot_state.tighten_mode and net_pos != 0:
+            if net_pos > 0:
+                # Long timeout: ask at best_ask (most aggressive sell), no bid
+                result.ask_price = best_ask
+                result.bid_price = 0
+            else:
+                # Short timeout: bid at best_bid (most aggressive buy), no ask
+                result.bid_price = best_bid
+                result.ask_price = 0
+
         # Step 6: Size skewing based on inventory
         # When long: reduce bid size (less buying), keep ask size (sell to reduce)
         # When short: keep bid size (buy to reduce), reduce ask size (less selling)
         # When at max position: zero out the adding-to-position side
-        if net_pos > 0:
+        if bot_state.tighten_mode and net_pos != 0:
+            # Tighten mode: only exit direction at base_size
+            if net_pos > 0:
+                result.bid_size = 0
+                result.ask_size = self.base_size
+            else:
+                result.bid_size = self.base_size
+                result.ask_size = 0
+        elif net_pos > 0:
             pos_ratio = net_pos / self.max_position if self.max_position > 0 else 1
             result.bid_size = self.base_size * max(0, 1 - pos_ratio)
             result.ask_size = self.base_size

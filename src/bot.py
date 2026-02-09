@@ -215,6 +215,8 @@ class SpreadCaptureBot:
         orderbook_interval = 10.0  # Fetch orderbook every 10s for OBI
         last_reconcile = 0.0
         reconcile_interval = 30.0  # REST position reconciliation every 30s
+        last_timeout_log = 0.0
+        timeout_log_interval = 30.0  # Debounce timeout log to 30s
 
         while self.running:
             try:
@@ -266,22 +268,28 @@ class SpreadCaptureBot:
                         self.bot_state.position_entry_time
                     )
                     if inv_status == "emergency_exit":
-                        log.warning("[EMERGENCY] Inventory timeout exceeded, force closing")
-                        await self.emergency_exit()
+                        if not self.bot_state.emergency_exit_in_progress:
+                            log.warning("[EMERGENCY] Inventory timeout exceeded, force closing")
+                            await self.emergency_exit()
                         continue
                     elif inv_status == "tighten_exit":
-                        log.info("[TIMEOUT] Tightening exit spread")
-                        # Will be reflected in quote generation via inventory ratio
+                        self.bot_state.tighten_mode = True
+                        now_t = time.time()
+                        if now_t - last_timeout_log > timeout_log_interval:
+                            hold_time = now_t - self.bot_state.position_entry_time
+                            log.info(f"[TIMEOUT] Tightening exit spread (held {hold_time:.0f}s)")
+                            last_timeout_log = now_t
 
                 # Unrealized loss check
                 if self.risk_manager.check_unrealized_loss(
                     self.bot_state.unrealized_pnl
                 ):
-                    log.warning(
-                        f"[EMERGENCY] Unrealized loss ${self.bot_state.unrealized_pnl:.4f} "
-                        f"exceeds limit, force closing"
-                    )
-                    await self.emergency_exit()
+                    if not self.bot_state.emergency_exit_in_progress:
+                        log.warning(
+                            f"[EMERGENCY] Unrealized loss ${self.bot_state.unrealized_pnl:.4f} "
+                            f"exceeds limit, force closing"
+                        )
+                        await self.emergency_exit()
                     continue
 
                 # Check if it's time to refresh quotes
@@ -345,6 +353,17 @@ class SpreadCaptureBot:
         """
         orders_used = 0
 
+        # Hard position cap: block adding-direction orders regardless of quote engine
+        current_pos = self.bot_state.net_position
+        if current_pos >= self.max_position:
+            if quotes.bid_size > 0:
+                log.info(f"[POSITION CAP] Long {current_pos:+.4f} >= max {self.max_position}, bid blocked")
+                quotes.bid_size = 0
+        elif current_pos <= -self.max_position:
+            if quotes.ask_size > 0:
+                log.info(f"[POSITION CAP] Short {current_pos:+.4f} >= max {self.max_position}, ask blocked")
+                quotes.ask_size = 0
+
         # Cancel existing bid if price changed or no longer needed
         # Cancels do NOT count toward Paradex order rate limit (separate 300ms speed bump)
         if self.bot_state.open_bid_id:
@@ -400,34 +419,98 @@ class SpreadCaptureBot:
         self.bot_state.last_quote_time = time.time()
 
     async def emergency_exit(self):
-        """Emergency position close: cancel all orders, IOC market close."""
-        log.warning("[EMERGENCY EXIT] Cancelling all orders...")
-        await self.client.cancel_all(self.market_name)
-        self.bot_state.clear_orders()
+        """Emergency position close: cancel all, query REST real position, then close.
 
-        if not self.bot_state.has_position:
+        Uses REST position (not internal tracking) to avoid reduce_only rejection
+        when internal state diverges from exchange. Includes anti-reentrancy and
+        price protection via IOC limit order.
+        """
+        # Anti-reentrancy: 10s cooldown between attempts
+        now = time.time()
+        if self.bot_state.emergency_exit_in_progress:
+            log.debug("[EMERGENCY EXIT] Already in progress, skipping")
+            return
+        if now - self.bot_state.emergency_exit_last_attempt < 10:
+            log.debug("[EMERGENCY EXIT] Cooldown active, skipping")
             return
 
-        net = self.bot_state.net_position
-        close_side = "SELL" if net > 0 else "BUY"
-        close_size = abs(net)
+        self.bot_state.emergency_exit_in_progress = True
+        self.bot_state.emergency_exit_last_attempt = now
 
-        log.warning(f"[EMERGENCY EXIT] IOC {close_side} {close_size:.4f} BTC")
+        try:
+            log.warning("[EMERGENCY EXIT] Cancelling all orders...")
+            await self.client.cancel_all(self.market_name)
+            self.bot_state.clear_orders()
 
-        # Use IOC market order for guaranteed fill
-        result = await self.client.place_order(
-            side=close_side,
-            price=0,
-            size=close_size,
-            instruction="IOC",
-            order_type="Market",
-            reduce_only=True,
-        )
-        if result:
-            self.risk_manager.record_order()
-            log.info("[EMERGENCY EXIT] Position closed")
-        else:
-            log.error("[EMERGENCY EXIT] Failed to close position!")
+            # Query REST for real position — do NOT trust internal tracking
+            positions = await self.client.get_positions()
+            btc_pos = [p for p in positions if p.get("market") == self.market_name]
+
+            if not btc_pos or float(btc_pos[0].get("size", 0)) < 0.00005:
+                log.info("[EMERGENCY EXIT] No position on exchange, syncing local state")
+                self.bot_state.net_position = 0.0
+                self.bot_state.position_entry_time = 0
+                self.bot_state.tighten_mode = False
+                return
+
+            real_size = float(btc_pos[0]["size"])
+            real_side = btc_pos[0].get("side", "")
+            close_side = "SELL" if real_side == "LONG" else "BUY"
+
+            # Sync internal state to REST value
+            self.bot_state.net_position = real_size if real_side == "LONG" else -real_size
+
+            log.warning(
+                f"[EMERGENCY EXIT] Exchange position: {real_side} {real_size:.4f} BTC. "
+                f"Sending {close_side} {real_size:.4f}"
+            )
+
+            # IOC limit order with $5 slippage protection
+            bbo = await self.client.get_bbo()
+            if bbo:
+                slippage = 5.0
+                if close_side == "SELL":
+                    limit_price = bbo["bid"] - slippage
+                else:
+                    limit_price = bbo["ask"] + slippage
+
+                result = await self.client.place_order(
+                    side=close_side,
+                    price=limit_price,
+                    size=real_size,
+                    instruction="IOC",
+                    order_type="Limit",
+                    reduce_only=True,
+                )
+            else:
+                # Fallback: market IOC if BBO unavailable
+                result = await self.client.place_order(
+                    side=close_side,
+                    price=0,
+                    size=real_size,
+                    instruction="IOC",
+                    order_type="Market",
+                    reduce_only=True,
+                )
+
+            if result:
+                self.risk_manager.record_order()
+                # Verify close after 1s
+                await asyncio.sleep(1)
+                positions2 = await self.client.get_positions()
+                btc_pos2 = [p for p in positions2 if p.get("market") == self.market_name]
+                if not btc_pos2 or float(btc_pos2[0].get("size", 0)) < 0.00005:
+                    log.info("[EMERGENCY EXIT] Position confirmed closed")
+                    self.bot_state.net_position = 0.0
+                    self.bot_state.position_entry_time = 0
+                    self.bot_state.tighten_mode = False
+                else:
+                    remaining = float(btc_pos2[0].get("size", 0))
+                    log.error(f"[EMERGENCY EXIT] Position still open: {remaining:.4f} BTC")
+            else:
+                log.error("[EMERGENCY EXIT] Failed to send exit order!")
+        finally:
+            self.bot_state.emergency_exit_in_progress = False
 
     # =========================================================================
     # Fill / Order Handling
@@ -464,6 +547,7 @@ class SpreadCaptureBot:
             self.bot_state.position_entry_time = time.time()
         elif not self.bot_state.has_position:
             self.bot_state.position_entry_time = 0
+            self.bot_state.tighten_mode = False
 
         # Update realized PnL
         self.bot_state.realized_pnl_session = summary["cumulative_pnl"]
@@ -477,6 +561,25 @@ class SpreadCaptureBot:
         elif order_id == self.bot_state.open_ask_id:
             self.bot_state.open_ask_id = None
             self.bot_state.open_ask_price = 0.0
+
+        # Fix F: Cancel adding-direction orders when position > 50% max
+        if abs(self.bot_state.net_position) >= self.max_position * 0.5:
+            if self.bot_state.net_position > 0 and self.bot_state.open_bid_id:
+                log.info("[RISK] Position heavy long, cancelling bid")
+                try:
+                    await self.client.cancel_order(self.bot_state.open_bid_id)
+                except Exception as e:
+                    log.debug(f"Cancel bid failed: {e}")
+                self.bot_state.open_bid_id = None
+                self.bot_state.open_bid_price = 0.0
+            elif self.bot_state.net_position < 0 and self.bot_state.open_ask_id:
+                log.info("[RISK] Position heavy short, cancelling ask")
+                try:
+                    await self.client.cancel_order(self.bot_state.open_ask_id)
+                except Exception as e:
+                    log.debug(f"Cancel ask failed: {e}")
+                self.bot_state.open_ask_id = None
+                self.bot_state.open_ask_price = 0.0
 
         # Log
         rpnl = summary["realized_pnl"]
@@ -672,12 +775,15 @@ class SpreadCaptureBot:
             await self.client.cancel_all(self.market_name)
             self.bot_state.clear_orders()
 
-            # Close position if any
-            if self.bot_state.has_position:
-                net = self.bot_state.net_position
-                close_side = "SELL" if net > 0 else "BUY"
-                close_size = abs(net)
-                log.info(f"Closing position: {close_side} {close_size:.4f} BTC")
+            # Close position if any — query REST real position, don't trust internal state
+            positions = await self.client.get_positions()
+            btc_pos = [p for p in positions if p.get("market") == self.market_name]
+
+            if btc_pos and float(btc_pos[0].get("size", 0)) > 0.00005:
+                real_size = float(btc_pos[0]["size"])
+                real_side = btc_pos[0].get("side", "")
+                close_side = "SELL" if real_side == "LONG" else "BUY"
+                log.info(f"Closing position: {close_side} {real_size:.4f} BTC (from REST)")
 
                 # Try limit order first (maker)
                 bbo = await self.client.get_bbo()
@@ -686,30 +792,35 @@ class SpreadCaptureBot:
                     result = await self.client.place_order(
                         side=close_side,
                         price=price,
-                        size=close_size,
+                        size=real_size,
                         instruction="POST_ONLY",
                         reduce_only=True,
                     )
                     if result:
-                        # Wait briefly for fill
-                        await asyncio.sleep(3)
-                        positions = await self.client.get_positions()
-                        still_open = any(
-                            p.get("market") == self.market_name and
-                            float(p.get("size", 0)) > 0.00001
-                            for p in positions
-                        )
-                        if still_open:
-                            log.info("Maker exit pending, sending IOC market close...")
+                        await asyncio.sleep(6)
+                        # Re-query REST to check if closed
+                        positions2 = await self.client.get_positions()
+                        btc_pos2 = [
+                            p for p in positions2
+                            if p.get("market") == self.market_name
+                            and float(p.get("size", 0)) > 0.00005
+                        ]
+                        if btc_pos2:
+                            remaining = float(btc_pos2[0]["size"])
+                            remaining_side = btc_pos2[0].get("side", "")
+                            remaining_close = "SELL" if remaining_side == "LONG" else "BUY"
+                            log.info(f"Maker exit incomplete, IOC closing {remaining:.4f} BTC")
                             await self.client.cancel_all(self.market_name)
                             await self.client.place_order(
-                                side=close_side,
+                                side=remaining_close,
                                 price=0,
-                                size=close_size,
+                                size=remaining,
                                 instruction="IOC",
                                 order_type="Market",
                                 reduce_only=True,
                             )
+            else:
+                log.info("No position on exchange to close")
 
             # Close client
             await self.client.close()

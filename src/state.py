@@ -69,6 +69,13 @@ class BotState:
     last_sigma: float = 0.0
     last_obi: float = 0.0
 
+    # Emergency exit anti-reentrancy (Fix B)
+    emergency_exit_in_progress: bool = False
+    emergency_exit_last_attempt: float = 0.0
+
+    # Tighten mode: tight BBO exit after inventory timeout (Fix D)
+    tighten_mode: bool = False
+
     @property
     def has_position(self) -> bool:
         return abs(self.net_position) >= 0.00005

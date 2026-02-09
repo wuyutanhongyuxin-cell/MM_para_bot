@@ -347,6 +347,49 @@ class TestVolatility:
         assert sigma == 5.0  # Default
 
 
+class TestTightenMode:
+    """Test tighten_mode behavior after inventory timeout."""
+
+    def test_tighten_mode_long_ask_at_best_ask(self):
+        """Tighten mode with long position should place ask at best_ask."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(0.0005)
+        bs.tighten_mode = True
+
+        result = engine.generate_quotes(ms, bs)
+        assert result.ask_price == 97502.0  # At best_ask
+        assert result.bid_size == 0  # No adding-direction
+
+    def test_tighten_mode_short_bid_at_best_bid(self):
+        """Tighten mode with short position should place bid at best_bid."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(-0.0005)
+        bs.tighten_mode = True
+
+        result = engine.generate_quotes(ms, bs)
+        assert result.bid_price == 97500.0  # At best_bid
+        assert result.ask_size == 0  # No adding-direction
+
+    def test_tighten_mode_no_effect_when_flat(self):
+        """Tighten mode should not affect flat position."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(0.0)
+        bs.tighten_mode = True
+
+        result = engine.generate_quotes(ms, bs)
+        assert result.bid_size > 0
+        assert result.ask_size > 0
+
+
 class TestSpreadWidening:
     """Test spread widens with inventory."""
 
