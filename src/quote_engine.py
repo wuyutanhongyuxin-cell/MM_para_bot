@@ -267,10 +267,13 @@ class QuoteEngine:
             result.ask_size = self.base_size
 
         # Enforce minimum size (0.0003 BTC for Paradex)
+        # Round UP to min_size (keep dual-sided quoting for spread capture).
+        # Only truly zero sizes (from max position or tighten mode) stay at 0.
+        # The hard position cap in bot.py blocks adding direction at max_position.
         min_size = 0.0003
-        if result.bid_size < min_size:
-            result.bid_size = 0
-        if result.ask_size < min_size:
-            result.ask_size = 0
+        if 0 < result.bid_size < min_size:
+            result.bid_size = min_size
+        if 0 < result.ask_size < min_size:
+            result.ask_size = min_size
 
         return result
