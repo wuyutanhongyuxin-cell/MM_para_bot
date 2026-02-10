@@ -136,6 +136,8 @@ class ParadexClient:
         """Authenticate with interactive token for Retail Profile (0% fees).
 
         Uses SDK for signing, then manually calls /auth?token_usage=interactive.
+        Also monkey-patches SDK's auth() so its 4-minute auto-refresh
+        continues using interactive auth instead of reverting to standard.
         """
         if self._paradex:
             try:
@@ -150,13 +152,11 @@ class ParadexClient:
                         if resp.status == 200:
                             data = await resp.json()
                             self._jwt_token = data.get("jwt_token")
-                            # Decode JWT to get expiry
                             self._decode_jwt_expiry()
-                            # Inject into SDK so SDK methods also use it
-                            if hasattr(self._paradex, 'api_client') and hasattr(
-                                self._paradex.api_client, 'set_token'
-                            ):
-                                self._paradex.api_client.set_token(self._jwt_token)
+                            # Inject interactive JWT into SDK (correct method names)
+                            self._inject_sdk_token(self._jwt_token)
+                            # Patch SDK auth refresh to use interactive forever
+                            self._patch_sdk_interactive_auth()
                             log.info("Retail auth OK (interactive token, 0% fees)")
                             return
                         else:
@@ -168,6 +168,53 @@ class ParadexClient:
         # Fallback: standard auth
         log.warning("Falling back to standard auth (may have fees)")
         await self._auth_standard()
+
+    def _inject_sdk_token(self, jwt_token: str):
+        """Inject JWT token into SDK's account and HTTP client."""
+        if not self._paradex:
+            return
+        # Set on account object (SDK method: set_jwt_token, not set_token)
+        self._paradex.account.set_jwt_token(jwt_token)
+        # Set on HTTP client headers so all SDK requests use it
+        self._paradex.api_client.client.headers.update(
+            {"Authorization": f"Bearer {jwt_token}"}
+        )
+        # Reset auth timestamp so SDK doesn't immediately trigger refresh
+        self._paradex.api_client.auth_timestamp = time.time()
+
+    def _patch_sdk_interactive_auth(self):
+        """Monkey-patch SDK's auth() to always use interactive token.
+
+        The SDK's _validate_auth() calls self.auth() every 4 minutes.
+        By default, auth() calls POST /auth (standard = Pro profile).
+        This patch makes it call POST /auth?token_usage=interactive instead.
+        """
+        if not self._paradex:
+            return
+
+        from paradex_py.api.models import AuthSchema as _AuthSchema
+        api_client = self._paradex.api_client
+        parent = self
+
+        def interactive_auth():
+            headers = api_client.account.auth_headers()
+            res = api_client.post(
+                api_url=api_client.api_url,
+                path="auth",
+                headers=headers,
+                params={"token_usage": "interactive"},
+            )
+            data = _AuthSchema().load(res, unknown="exclude", partial=True)
+            api_client.auth_timestamp = time.time()
+            api_client.account.set_jwt_token(data.jwt_token)
+            api_client.client.headers.update(
+                {"Authorization": f"Bearer {data.jwt_token}"}
+            )
+            parent._jwt_token = data.jwt_token
+            parent._decode_jwt_expiry()
+            log.info("SDK auth refreshed (interactive token, 0% fees)")
+
+        api_client.auth = interactive_auth
 
     async def _auth_standard(self):
         """Standard SDK authentication (Pro Profile)."""
