@@ -12,9 +12,9 @@ from src.vol_pause_logger import VolPauseLogger, COOLDOWN_SEC, CSV_HEADER
 
 
 @pytest.fixture
-def tmp_paths(tmp_path):
-    """Return temp CSV and JSONL paths."""
-    return str(tmp_path / "events.csv"), str(tmp_path / "events.jsonl")
+def tmp_dir(tmp_path):
+    """Return temp output directory."""
+    return str(tmp_path / "vollogs")
 
 
 @pytest.fixture
@@ -27,11 +27,11 @@ def mock_market():
 
 class TestVolPauseLogger:
 
-    def test_csv_header_created(self, tmp_paths, mock_market):
+    def test_csv_header_created(self, tmp_dir, mock_market):
         """CSV file should be created with header on init."""
-        csv_path, jsonl_path = tmp_paths
-        logger = VolPauseLogger(mock_market, csv_path=csv_path, jsonl_path=jsonl_path)
+        logger = VolPauseLogger(mock_market, output_dir=tmp_dir)
 
+        csv_path = os.path.join(tmp_dir, "vol_pause_events.csv")
         assert os.path.exists(csv_path)
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.reader(f)
@@ -39,10 +39,9 @@ class TestVolPauseLogger:
         assert header == CSV_HEADER
 
     @pytest.mark.asyncio
-    async def test_cooldown_dedup(self, tmp_paths, mock_market):
+    async def test_cooldown_dedup(self, tmp_dir, mock_market):
         """Events within 300s cooldown should be deduplicated."""
-        csv_path, jsonl_path = tmp_paths
-        logger = VolPauseLogger(mock_market, csv_path=csv_path, jsonl_path=jsonl_path)
+        logger = VolPauseLogger(mock_market, output_dir=tmp_dir)
 
         # First event — should be recorded
         logger.record_event(97500.0, 15.0, -30.0, -0.15, 2.0)
@@ -54,10 +53,9 @@ class TestVolPauseLogger:
         assert len(logger._tracking_tasks) == 1
 
     @pytest.mark.asyncio
-    async def test_cooldown_allows_after_expiry(self, tmp_paths, mock_market):
+    async def test_cooldown_allows_after_expiry(self, tmp_dir, mock_market):
         """Events after cooldown should be recorded."""
-        csv_path, jsonl_path = tmp_paths
-        logger = VolPauseLogger(mock_market, csv_path=csv_path, jsonl_path=jsonl_path)
+        logger = VolPauseLogger(mock_market, output_dir=tmp_dir)
 
         # First event
         logger.record_event(97500.0, 15.0, -30.0, -0.15, 2.0)
@@ -71,10 +69,12 @@ class TestVolPauseLogger:
         assert len(logger._tracking_tasks) == 2
 
     @pytest.mark.asyncio
-    async def test_price_tracking_writes_files(self, tmp_paths, mock_market):
+    async def test_price_tracking_writes_files(self, tmp_dir, mock_market):
         """After tracking completes, CSV and JSONL should contain event data."""
-        csv_path, jsonl_path = tmp_paths
-        logger = VolPauseLogger(mock_market, csv_path=csv_path, jsonl_path=jsonl_path)
+        logger = VolPauseLogger(mock_market, output_dir=tmp_dir)
+
+        csv_path = logger.csv_path
+        jsonl_path = logger.jsonl_path
 
         # Simulate price moving during tracking
         prices = iter([97510.0, 97520.0, 97490.0, 97505.0, 97515.0])
@@ -90,7 +90,6 @@ class TestVolPauseLogger:
             await original_sleep(0)
 
         # Monkey-patch asyncio.sleep for fast test
-        import src.vol_pause_logger as vpl_module
         _orig = asyncio.sleep
         asyncio.sleep = fast_sleep
 
@@ -120,8 +119,7 @@ class TestVolPauseLogger:
         assert "min_price_300s" in event
 
     @pytest.mark.asyncio
-    async def test_flush_pending_empty(self, tmp_paths, mock_market):
+    async def test_flush_pending_empty(self, tmp_dir, mock_market):
         """flush_pending should be safe with no tasks."""
-        csv_path, jsonl_path = tmp_paths
-        logger = VolPauseLogger(mock_market, csv_path=csv_path, jsonl_path=jsonl_path)
+        logger = VolPauseLogger(mock_market, output_dir=tmp_dir)
         await logger.flush_pending()  # Should not raise

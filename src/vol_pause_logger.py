@@ -38,11 +38,11 @@ CSV_HEADER = [
 class VolPauseLogger:
     """Records vol_pause events and tracks price movements afterward."""
 
-    def __init__(self, market_state, csv_path: str = "vol_pause_events.csv",
-                 jsonl_path: str = "vol_pause_events.jsonl"):
+    def __init__(self, market_state, output_dir: str = "vollogs"):
         self.market_state = market_state
-        self.csv_path = csv_path
-        self.jsonl_path = jsonl_path
+        os.makedirs(output_dir, exist_ok=True)
+        self.csv_path = os.path.join(output_dir, "vol_pause_events.csv")
+        self.jsonl_path = os.path.join(output_dir, "vol_pause_events.jsonl")
         self._last_event_time: float = 0.0
         self._tracking_tasks: list = []
 
