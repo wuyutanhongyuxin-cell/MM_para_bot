@@ -32,6 +32,7 @@ from .quote_engine import QuoteEngine
 from .risk_manager import RiskManager
 from .state import MarketState, BotState, PnLTracker
 from .utils import format_price, format_size, elapsed_since
+from .vol_pause_logger import VolPauseLogger
 
 log = logging.getLogger("MM-BOT")
 
@@ -63,6 +64,7 @@ class SpreadCaptureBot:
         self.risk_manager = RiskManager(self.config)
         self.csv_writer = TradeCSVWriter(log_cfg.get("trade_csv", "trades.csv"))
         self.status_printer = StatusPrinter(log_cfg.get("console_interval", 30))
+        self.vol_pause_logger = VolPauseLogger(self.market_state)
 
         # Client (initialized in run())
         self.client: Optional[ParadexClient] = None
@@ -345,6 +347,16 @@ class SpreadCaptureBot:
                 quotes = self.quote_engine.generate_quotes(
                     self.market_state, self.bot_state
                 )
+
+                # Record vol_pause event for offline analysis
+                if quotes.vol_paused:
+                    self.vol_pause_logger.record_event(
+                        trigger_price=self.market_state.mid_price,
+                        range_60s=self.quote_engine.calc_recent_range(60),
+                        momentum=self.quote_engine.calc_momentum(),
+                        obi=quotes.obi,
+                        spread=self.market_state.spread,
+                    )
 
                 if quotes.skip_reason:
                     log.info(f"Quote skipped: {quotes.skip_reason}")
@@ -811,6 +823,9 @@ class SpreadCaptureBot:
         log.info("=" * 60)
         log.info("  SHUTTING DOWN")
         log.info("=" * 60)
+
+        # Flush pending vol-pause tracking tasks
+        await self.vol_pause_logger.flush_pending()
 
         if self.client:
             # Cancel all orders

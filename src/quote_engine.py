@@ -33,6 +33,7 @@ class QuoteResult:
     obi: float = 0.0
     half_spread: float = 0.0
     skip_reason: str = ""
+    vol_paused: bool = False
 
 
 class QuoteEngine:
@@ -294,6 +295,7 @@ class QuoteEngine:
             # If 60s price range > threshold, stale quotes will be adversely selected
             recent_range = self.calc_recent_range(60)
             if recent_range > self.vol_pause_threshold:
+                result.vol_paused = True
                 if net_pos == 0:
                     result.bid_size = 0
                     result.ask_size = 0
