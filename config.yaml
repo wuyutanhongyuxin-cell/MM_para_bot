@@ -18,14 +18,15 @@ strategy:
   max_position: 0.001              # Maximum net position (BTC)
   vol_window: 300                  # Volatility window (seconds) — 60s too short, sigma stuck at floor
   min_sigma: 8.0                   # Sigma floor ($) — actual BTC σ=$31, prev floor=1.0 was 30x too low
+  momentum_window: 300             # Momentum lookback window (seconds)
+  momentum_threshold: 40           # Price change ($) to trigger trend guard
   tick_size: 1.0                   # BTC-USD-PERP tick size ($1)
 
 # ============ OBI (Order Book Imbalance) Overlay ============
 obi:
   enabled: true
   alpha: 0.3                       # EMA smoothing factor (0=slow, 1=fast)
-  threshold: 0.3                   # Activation threshold: |obi| > threshold
-  delta: 0.3                       # Signal strength (fair_price offset magnitude)
+  threshold: 0.2                   # Protective filter threshold (lowered: false-stop < false-pass)
   depth: 5                         # Use top N levels of orderbook
 
 # ============ Risk Management ============

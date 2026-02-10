@@ -1,12 +1,12 @@
-"""Quote Engine: Simplified Avellaneda-Stoikov + OBI Contrarian Overlay.
+"""Quote Engine: Avellaneda-Stoikov + Momentum Guard + OBI Protective Filter.
 
 Core algorithm:
     1. Fair Price = mid - gamma * net_position * sigma^2
-    2. OBI Overlay: if |obi_smooth| > threshold, shift fair_price contra OBI
-    3. Half Spread = max(min_spread, spread*0.4 + kappa*sigma)
-    4. Bid = fair - half_spread (floor to tick), Ask = fair + half_spread (ceil to tick)
-    5. Enforce no-crossing: bid <= best_bid, ask >= best_ask
-    6. Size skewing based on inventory
+    2. Half Spread = max(min_spread, spread*0.4 + kappa*sigma)
+    3. Bid = fair - half_spread (floor to tick), Ask = fair + half_spread (ceil to tick)
+    4. Enforce no-crossing: bid <= best_bid, ask >= best_ask
+    5. Size skewing based on inventory
+    6. Protective filters: momentum guard + OBI filter (block adverse-side entries)
 """
 
 import logging
@@ -52,12 +52,13 @@ class QuoteEngine:
         self.vol_window = strategy.get("vol_window", 300)
         self.tick_size = strategy.get("tick_size", 1.0)
         self.min_sigma = strategy.get("min_sigma", 8.0)
+        self.momentum_window = strategy.get("momentum_window", 300)
+        self.momentum_threshold = strategy.get("momentum_threshold", 40)
 
         # OBI params
         self.obi_enabled = obi_cfg.get("enabled", True)
         self.obi_alpha = obi_cfg.get("alpha", 0.3)
-        self.obi_threshold = obi_cfg.get("threshold", 0.3)
-        self.obi_delta = obi_cfg.get("delta", 0.3)
+        self.obi_threshold = obi_cfg.get("threshold", 0.2)
         self.obi_depth = obi_cfg.get("depth", 5)
 
         # State — mid_prices stores (timestamp, price) tuples
@@ -112,13 +113,24 @@ class QuoteEngine:
         self._last_sigma = sigma
         return sigma
 
+    def calc_momentum(self) -> float:
+        """Price change over momentum window. Positive = rising, negative = falling."""
+        if len(self.mid_prices) < 2:
+            return 0.0
+        now_ts = self.mid_prices[-1][0]
+        cutoff = now_ts - self.momentum_window
+        for ts, price in self.mid_prices:
+            if ts >= cutoff:
+                return self.mid_prices[-1][1] - price
+        return self.mid_prices[-1][1] - self.mid_prices[0][1]
+
     def calc_obi(self, bids: list, asks: list) -> float:
         """Calculate EMA-smoothed Order Book Imbalance.
 
         OBI = (bid_vol - ask_vol) / (bid_vol + ask_vol)
         Positive = more buy pressure, Negative = more sell pressure.
 
-        We use CONTRARIAN overlay: shift fair_price AGAINST OBI direction.
+        Used as protective filter: block entries in OBI direction.
         """
         depth = self.obi_depth
         bid_vol = sum(s for _, s in bids[:depth]) if bids else 0
@@ -165,14 +177,8 @@ class QuoteEngine:
         # When short (net_pos < 0), raise fair_price to encourage buying
         fair_price = mid - self.gamma * net_pos * (sigma ** 2)
 
-        # Step 3: OBI Contrarian Overlay
-        # When OBI is positive (buy pressure), we shift fair_price DOWN (contrarian)
-        # This makes our ask more aggressive (lower), willing to sell into buy pressure
+        # Step 3: Record OBI (protective filter applied in Step 7)
         result.obi = self.obi_smooth
-        if self.obi_enabled and abs(self.obi_smooth) > self.obi_threshold:
-            obi_shift = -self.obi_delta * self.obi_smooth * spread
-            fair_price += obi_shift
-            log.debug(f"[OBI] obi={self.obi_smooth:.3f} shift=${obi_shift:.2f}")
 
         result.fair_price = fair_price
 
@@ -268,6 +274,32 @@ class QuoteEngine:
         else:
             result.bid_size = self.base_size
             result.ask_size = self.base_size
+
+        # Step 7: Protective filters — block entries in adverse direction
+        # Skip in tighten_mode: exit takes absolute priority over filters
+        if not (bot_state.tighten_mode and net_pos != 0):
+            # 7a: Momentum guard — don't enter trades in trend direction
+            momentum = self.calc_momentum()
+            if abs(momentum) > self.momentum_threshold:
+                if momentum > 0 and net_pos <= 0:
+                    # Uptrend + flat/short: block ask (don't sell into rally)
+                    result.ask_size = 0
+                    log.info(f"[MOMENTUM] +${momentum:.0f}/{self.momentum_window}s → ask blocked")
+                elif momentum < 0 and net_pos >= 0:
+                    # Downtrend + flat/long: block bid (don't buy into selloff)
+                    result.bid_size = 0
+                    log.info(f"[MOMENTUM] -${abs(momentum):.0f}/{self.momentum_window}s → bid blocked")
+
+            # 7b: OBI protective filter — block entries in pressure direction
+            if self.obi_enabled and abs(self.obi_smooth) > self.obi_threshold:
+                if self.obi_smooth > 0 and net_pos <= 0:
+                    # Buy pressure + flat/short: block ask (don't sell)
+                    result.ask_size = 0
+                    log.info(f"[OBI-GUARD] buy pressure {self.obi_smooth:+.2f} → ask blocked")
+                elif self.obi_smooth < 0 and net_pos >= 0:
+                    # Sell pressure + flat/long: block bid (don't buy)
+                    result.bid_size = 0
+                    log.info(f"[OBI-GUARD] sell pressure {self.obi_smooth:+.2f} → bid blocked")
 
         # Enforce minimum size (0.0003 BTC for Paradex)
         # Round UP to min_size (keep dual-sided quoting for spread capture).

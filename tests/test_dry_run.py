@@ -21,8 +21,7 @@ def make_config():
         "obi": {
             "enabled": True,
             "alpha": 0.3,
-            "threshold": 0.3,
-            "delta": 0.3,
+            "threshold": 0.2,
             "depth": 5,
         },
         "risk": {

@@ -21,8 +21,7 @@ def make_config(**overrides):
         "obi": {
             "enabled": True,
             "alpha": 0.3,
-            "threshold": 0.3,
-            "delta": 0.3,
+            "threshold": 0.2,
             "depth": 5,
         },
     }
@@ -182,75 +181,91 @@ class TestInventorySkewing:
         assert result.ask_size == 0
 
 
-class TestOBIOverlay:
-    """Test OBI (Order Book Imbalance) contrarian overlay."""
+class TestOBIProtectiveFilter:
+    """Test OBI protective filter (blocks adverse-side entries)."""
 
-    def test_positive_obi_shifts_fair_down(self):
-        """Positive OBI (buy pressure) should shift fair_price DOWN (contrarian)."""
+    def test_positive_obi_blocks_ask(self):
+        """Positive OBI (buy pressure) should block ask when flat (don't sell into rally)."""
         engine = QuoteEngine(make_config())
         seed_prices(engine, [97501.0] * 20)
 
         # Strong buy pressure — call multiple times to build up EMA
         bids = [(97500 - i, 10.0) for i in range(5)]
-        asks = [(97502 + i, 1.0) for i in range(5)]  # Much less ask volume
+        asks = [(97502 + i, 1.0) for i in range(5)]
         for _ in range(10):
             engine.calc_obi(bids, asks)
 
-        # OBI should be positive and above threshold
-        assert engine.obi_smooth > 0.3
+        assert engine.obi_smooth > 0.2  # Above protective threshold
 
         ms = make_market()
-        bs = make_bot(0.0)
+        bs = make_bot(0.0)  # Flat
         result = engine.generate_quotes(ms, bs)
 
-        # Fair price should be shifted down from mid
-        assert result.fair_price < ms.mid_price
+        # Ask should be blocked (don't sell into buy pressure)
+        assert result.ask_size == 0
+        # Bid should still be active
+        assert result.bid_size > 0
 
-    def test_negative_obi_shifts_fair_up(self):
-        """Negative OBI (sell pressure) should shift fair_price UP (contrarian)."""
+    def test_negative_obi_blocks_bid(self):
+        """Negative OBI (sell pressure) should block bid when flat (don't buy into selloff)."""
         engine = QuoteEngine(make_config())
         seed_prices(engine, [97501.0] * 20)
 
-        # Strong sell pressure — call multiple times to build up EMA
+        # Strong sell pressure
         bids = [(97500 - i, 1.0) for i in range(5)]
         asks = [(97502 + i, 10.0) for i in range(5)]
         for _ in range(10):
             engine.calc_obi(bids, asks)
 
-        assert engine.obi_smooth < -0.3
+        assert engine.obi_smooth < -0.2
 
         ms = make_market()
         bs = make_bot(0.0)
         result = engine.generate_quotes(ms, bs)
 
-        assert result.fair_price > ms.mid_price
+        assert result.bid_size == 0
+        assert result.ask_size > 0
 
-    def test_obi_below_threshold_no_shift(self):
-        """OBI below threshold should not shift fair price."""
+    def test_obi_allows_exit_when_long(self):
+        """Buy pressure should NOT block ask when we're long (need to sell to exit)."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        bids = [(97500 - i, 10.0) for i in range(5)]
+        asks = [(97502 + i, 1.0) for i in range(5)]
+        for _ in range(10):
+            engine.calc_obi(bids, asks)
+
+        ms = make_market()
+        bs = make_bot(0.003)  # Long position — need ask to exit
+        result = engine.generate_quotes(ms, bs)
+
+        # Ask should NOT be blocked (we're long, ask = exit direction)
+        assert result.ask_size > 0
+
+    def test_obi_below_threshold_no_filter(self):
+        """OBI below threshold should not filter any side."""
         engine = QuoteEngine(make_config(**{"obi.threshold": 0.3}))
         seed_prices(engine, [97501.0] * 20)
 
-        # Balanced book
         bids = [(97500 - i, 5.0) for i in range(5)]
         asks = [(97502 + i, 5.0) for i in range(5)]
         engine.calc_obi(bids, asks)
 
-        # OBI ~0, below threshold
         assert abs(engine.obi_smooth) < 0.3
 
         ms = make_market()
         bs = make_bot(0.0)
         result = engine.generate_quotes(ms, bs)
 
-        # Fair should be ~mid (no OBI shift)
-        assert abs(result.fair_price - ms.mid_price) < 1.0
+        assert result.bid_size > 0
+        assert result.ask_size > 0
 
     def test_obi_disabled(self):
-        """With OBI disabled, fair price should not be affected by order book."""
+        """With OBI disabled, no filtering should occur."""
         engine = QuoteEngine(make_config(**{"obi.enabled": False}))
         seed_prices(engine, [97501.0] * 20)
 
-        # Extreme imbalance
         bids = [(97500 - i, 100.0) for i in range(5)]
         asks = [(97502 + i, 1.0) for i in range(5)]
         engine.calc_obi(bids, asks)
@@ -259,8 +274,8 @@ class TestOBIOverlay:
         bs = make_bot(0.0)
         result = engine.generate_quotes(ms, bs)
 
-        # Fair should be ~mid even with extreme OBI (disabled)
-        assert abs(result.fair_price - ms.mid_price) < 1.0
+        assert result.bid_size > 0
+        assert result.ask_size > 0
 
 
 class TestTickAlignment:
@@ -388,6 +403,109 @@ class TestTightenMode:
         result = engine.generate_quotes(ms, bs)
         assert result.bid_size > 0
         assert result.ask_size > 0
+
+
+class TestMomentumGuard:
+    """Test momentum guard — blocks entries in trend direction."""
+
+    def test_uptrend_blocks_ask(self):
+        """Strong uptrend should block ask (don't sell into rally) when flat."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 30,
+            "strategy.momentum_window": 300,
+        }))
+        # Price rising $50 over window
+        t = time.time()
+        for i in range(20):
+            engine.mid_prices.append((t + i * 15, 97501.0 + i * 2.5))
+
+        ms = make_market(97548.0, 97550.0)
+        bs = make_bot(0.0)  # Flat
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.ask_size == 0  # Blocked
+        assert result.bid_size > 0   # Still active
+
+    def test_downtrend_blocks_bid(self):
+        """Strong downtrend should block bid (don't buy into selloff) when flat."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 30,
+            "strategy.momentum_window": 300,
+        }))
+        t = time.time()
+        for i in range(20):
+            engine.mid_prices.append((t + i * 15, 97501.0 - i * 2.5))
+
+        ms = make_market(97450.0, 97452.0)
+        bs = make_bot(0.0)
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.bid_size == 0
+        assert result.ask_size > 0
+
+    def test_uptrend_allows_exit_when_long(self):
+        """Uptrend should NOT block ask when long (ask = exit/profit-taking)."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 30,
+            "strategy.momentum_window": 300,
+        }))
+        t = time.time()
+        for i in range(20):
+            engine.mid_prices.append((t + i * 15, 97501.0 + i * 2.5))
+
+        ms = make_market(97548.0, 97550.0)
+        bs = make_bot(0.003)  # Long — ask is exit direction
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.ask_size > 0  # NOT blocked (exit direction)
+
+    def test_downtrend_allows_exit_when_short(self):
+        """Downtrend should NOT block bid when short (bid = exit/cover)."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 30,
+            "strategy.momentum_window": 300,
+        }))
+        t = time.time()
+        for i in range(20):
+            engine.mid_prices.append((t + i * 15, 97501.0 - i * 2.5))
+
+        ms = make_market(97450.0, 97452.0)
+        bs = make_bot(-0.003)  # Short — bid is exit direction
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.bid_size > 0  # NOT blocked
+
+    def test_no_momentum_no_filter(self):
+        """Flat market should not trigger any filter."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 30,
+        }))
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market()
+        bs = make_bot(0.0)
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.bid_size > 0
+        assert result.ask_size > 0
+
+    def test_tighten_mode_overrides_momentum(self):
+        """Tighten mode exit should NOT be blocked by momentum guard."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 30,
+        }))
+        # Strong uptrend
+        t = time.time()
+        for i in range(20):
+            engine.mid_prices.append((t + i * 15, 97501.0 + i * 2.5))
+
+        ms = make_market(97548.0, 97550.0)
+        bs = make_bot(-0.003)  # Short position
+        bs.tighten_mode = True  # Need to exit urgently
+
+        result = engine.generate_quotes(ms, bs)
+        # bid should be active (exit direction for short), NOT blocked by momentum
+        assert result.bid_size > 0
 
 
 class TestSpreadWidening:
