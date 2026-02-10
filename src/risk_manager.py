@@ -33,10 +33,10 @@ class RiskManager:
         self._consecutive_losses: int = 0
         self._loss_pause_until: float = 0.0
 
-        # Fee tracking (Pro: maker 0.003% = 0.3bps, taker 0.02% = 2bps)
+        # Fee tracking (from config, default = Pro rates)
         self.total_fees: float = 0.0
-        self.maker_fee_rate: float = 0.00003   # 0.003%
-        self.taker_fee_rate: float = 0.0002    # 0.02%
+        self.maker_fee_rate: float = risk_cfg.get("maker_fee_rate", 0.00003)
+        self.taker_fee_rate: float = risk_cfg.get("taker_fee_rate", 0.0002)
 
         # Rate limits
         self.limits = {

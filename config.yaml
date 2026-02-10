@@ -40,6 +40,8 @@ risk:
   max_unrealized_loss: 2.00        # Max unrealized loss ($)
   consecutive_loss_pause: 5        # Pause after N consecutive losing trades
   consecutive_loss_cooldown: 30    # Cooldown seconds after consecutive loss trigger
+  maker_fee_rate: 0.00003          # Pro: 0.003% (Retail: 0)
+  taker_fee_rate: 0.0002           # Pro: 0.02%  (Retail: 0)
 
 # ============ Rate Limits (Pro Profile) ============
 rate_limit:
