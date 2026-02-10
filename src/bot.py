@@ -287,19 +287,10 @@ class SpreadCaptureBot:
                     await self._reconcile_position()
                     last_reconcile = time.time()
 
-                # Risk check
-                can_trade, reason = self.risk_manager.can_trade()
-                if not can_trade:
-                    if "paused_hour" in reason:
-                        log.info(f"[SCHEDULE] {reason}, sleeping 60s")
-                        await asyncio.sleep(60)
-                    elif "rate_limit" in reason:
-                        log.debug(f"Rate limit: {reason}")
-                        await asyncio.sleep(1)
-                    else:
-                        log.warning(f"Trading blocked: {reason}")
-                        await asyncio.sleep(10)
-                    continue
+                # ===============================================================
+                # EXIT CHECKS — always run, even during cooldown/pause.
+                # Principle: risk filters block ENTRIES, never EXITS.
+                # ===============================================================
 
                 # Inventory timeout check
                 if self.bot_state.has_position:
@@ -329,6 +320,28 @@ class SpreadCaptureBot:
                             f"exceeds limit, force closing"
                         )
                         await self.emergency_exit()
+                    continue
+
+                # ===============================================================
+                # ENTRY CHECKS — block new quotes when risk limits exceeded.
+                # ===============================================================
+
+                # Risk check (time filter + PnL limits + rate limits + circuit breaker)
+                can_trade, reason = self.risk_manager.can_trade()
+                if not can_trade:
+                    if "paused_hour" in reason:
+                        log.info(f"[SCHEDULE] {reason}, sleeping 60s")
+                        await asyncio.sleep(60)
+                    elif "rate_limit" in reason:
+                        log.debug(f"Rate limit: {reason}")
+                        await asyncio.sleep(1)
+                    else:
+                        # Debounce: only log every 60s for cooldown/loss limits
+                        now_t = time.time()
+                        if now_t - getattr(self, '_last_blocked_log', 0) > 60:
+                            log.warning(f"Trading blocked: {reason}")
+                            self._last_blocked_log = now_t
+                        await asyncio.sleep(10)
                     continue
 
                 # Check if it's time to refresh quotes

@@ -12,10 +12,10 @@ paradex:
 strategy:
   gamma: 0.3                       # Risk aversion (0.1=aggressive, 0.5=conservative) — faster refresh allows lower
   kappa: 1.5                       # Volatility sensitivity for spread (1.0-3.0)
-  min_half_spread: 3.0             # Minimum half-spread ($) — RT fee=$0.012 on 0.001 BTC, need >$4 spread
+  min_half_spread: 5.0             # Minimum half-spread ($) — fee breakeven=$2.91, need buffer
   refresh_interval: 2.0            # Quote refresh interval (sec) — Pro: no rate limit bottleneck
-  base_size: 0.001                 # Base order size (BTC) — $500 capital supports larger size
-  max_position: 0.003              # Maximum net position (BTC) — ~40% margin at $500
+  base_size: 0.003                 # Base order size (BTC) — $291 notional, ~$15 margin
+  max_position: 0.01               # Maximum net position (BTC) — $970 notional, ~$49 margin
   vol_window: 60                   # Volatility window (sec) — shorter for faster refresh
   min_sigma: 8.0                   # Sigma floor ($)
   momentum_window: 120             # Momentum lookback (sec) — shorter for faster reaction
@@ -32,12 +32,12 @@ obi:
 
 # ============ Risk Management ============
 risk:
-  max_loss_per_trade: 1.00         # Max loss per single trade ($) — scaled for 0.001 BTC
-  max_loss_per_hour: 3.00          # Max hourly loss ($)
-  max_loss_per_day: 8.00           # Max daily loss ($) — hard stop at $8
+  max_loss_per_trade: 3.00         # Max loss per single trade ($) — 0.01 BTC × $300 move
+  max_loss_per_hour: 10.00         # Max hourly loss ($)
+  max_loss_per_day: 25.00          # Max daily loss ($) — 5% of $500 capital
   inventory_timeout: 60            # Soft timeout (sec) — faster refresh = faster exit
   emergency_timeout: 180           # Hard timeout (sec) — force IOC close
-  max_unrealized_loss: 2.00        # Max unrealized loss ($)
+  max_unrealized_loss: 5.00        # Max unrealized loss ($)
   consecutive_loss_pause: 5        # Pause after N consecutive losing trades
   consecutive_loss_cooldown: 30    # Cooldown seconds after consecutive loss trigger
   maker_fee_rate: 0.00003          # Pro: 0.003% (Retail: 0)
