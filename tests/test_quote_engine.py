@@ -607,3 +607,36 @@ class TestSpreadWidening:
         spread_heavy = q_heavy.ask_price - q_heavy.bid_price
 
         assert spread_heavy >= spread_zero
+
+
+class TestSpreadFactor:
+    """Test configurable spread_factor parameter."""
+
+    def test_lower_spread_factor_tighter_quotes(self):
+        """Lower spread_factor should produce tighter half_spread."""
+        # Higher spread_factor (default 0.4)
+        engine_wide = QuoteEngine(make_config(**{"strategy.spread_factor": 0.4}))
+        seed_prices(engine_wide, [97501.0 + (i % 2) * 5 for i in range(20)])
+
+        # Lower spread_factor (0.25)
+        engine_tight = QuoteEngine(make_config(**{"strategy.spread_factor": 0.25}))
+        seed_prices(engine_tight, [97501.0 + (i % 2) * 5 for i in range(20)])
+
+        ms = make_market(97498.0, 97504.0)  # $6 spread
+        bs = make_bot(0.0)
+
+        q_wide = engine_wide.generate_quotes(ms, bs)
+        q_tight = engine_tight.generate_quotes(ms, bs)
+
+        # Tighter spread_factor -> smaller half_spread -> narrower bid-ask
+        assert q_tight.half_spread <= q_wide.half_spread
+
+    def test_spread_factor_default_backward_compat(self):
+        """Without spread_factor in config, should default to 0.4."""
+        engine = QuoteEngine(make_config())  # No spread_factor key
+        assert engine.spread_factor == 0.4
+
+    def test_spread_factor_from_config(self):
+        """spread_factor should be read from config."""
+        engine = QuoteEngine(make_config(**{"strategy.spread_factor": 0.25}))
+        assert engine.spread_factor == 0.25

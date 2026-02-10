@@ -53,6 +53,7 @@ class QuoteEngine:
         self.vol_window = strategy.get("vol_window", 300)
         self.tick_size = strategy.get("tick_size", 1.0)
         self.min_sigma = strategy.get("min_sigma", 8.0)
+        self.spread_factor = strategy.get("spread_factor", 0.4)
         self.momentum_window = strategy.get("momentum_window", 300)
         self.momentum_threshold = strategy.get("momentum_threshold", 40)
         self.vol_pause_threshold = strategy.get("vol_pause_threshold", 10)
@@ -196,7 +197,7 @@ class QuoteEngine:
         result.fair_price = fair_price
 
         # Step 4: Half Spread calculation
-        half_spread = max(self.min_half_spread, spread * 0.4 + self.kappa * sigma)
+        half_spread = max(self.min_half_spread, spread * self.spread_factor + self.kappa * sigma)
 
         # Widen spread when inventory is heavy
         inv_ratio = abs(net_pos) / self.max_position if self.max_position > 0 else 0
