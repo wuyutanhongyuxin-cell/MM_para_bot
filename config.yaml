@@ -13,7 +13,7 @@ strategy:
   gamma: 0.3                       # Risk aversion coefficient (0.1=aggressive, 0.5=conservative)
   kappa: 1.5                       # Volatility sensitivity for spread (1.0-3.0)
   min_half_spread: 1.0             # Minimum half-spread in $ (floor)
-  refresh_interval: 8.0            # Quote refresh interval (seconds)
+  refresh_interval: 60.0            # Quote refresh interval (seconds) — ~4 ops/cycle, 240/hr < 280 limit
   base_size: 0.0003                # Base order size (BTC) - minimum on Paradex
   max_position: 0.001              # Maximum net position (BTC)
   vol_window: 60                   # Volatility calculation window (seconds)

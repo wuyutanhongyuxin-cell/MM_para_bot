@@ -317,8 +317,8 @@ class SpreadCaptureBot:
                             log.info(f"[TIMEOUT] Tightening exit spread (held {hold_time:.0f}s)")
                             last_timeout_log = now_t
 
-                # Unrealized loss check
-                if self.risk_manager.check_unrealized_loss(
+                # Unrealized loss check (only when holding position)
+                if self.bot_state.has_position and self.risk_manager.check_unrealized_loss(
                     self.bot_state.unrealized_pnl
                 ):
                     if not self.bot_state.emergency_exit_in_progress:
@@ -335,8 +335,8 @@ class SpreadCaptureBot:
                     await asyncio.sleep(0.1)
                     continue
 
-                # Check rate limit headroom (up to 4 ops per cycle: 2 cancel + 2 place)
-                if not self.risk_manager.can_place_orders(4):
+                # Check rate limit headroom for new placements
+                if not self.risk_manager.can_place_orders(2):
                     log.debug("Not enough rate headroom for requote")
                     await asyncio.sleep(1)
                     continue
@@ -489,6 +489,8 @@ class SpreadCaptureBot:
                 self.bot_state.net_position = 0.0
                 self.bot_state.position_entry_time = 0
                 self.bot_state.tighten_mode = False
+                self.bot_state.avg_entry_price = 0.0
+                self.bot_state.unrealized_pnl = 0.0
                 return
 
             real_size = abs(float(btc_pos[0]["size"]))
@@ -542,6 +544,8 @@ class SpreadCaptureBot:
                     self.bot_state.net_position = 0.0
                     self.bot_state.position_entry_time = 0
                     self.bot_state.tighten_mode = False
+                    self.bot_state.avg_entry_price = 0.0
+                    self.bot_state.unrealized_pnl = 0.0
                 else:
                     remaining = abs(float(btc_pos2[0].get("size", 0)))
                     log.error(f"[EMERGENCY EXIT] Position still open: {remaining:.4f} BTC")
