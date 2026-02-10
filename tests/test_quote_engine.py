@@ -320,12 +320,12 @@ class TestVolatility:
     """Test volatility calculation."""
 
     def test_low_volatility(self):
-        """Stable prices should produce low volatility."""
+        """Stable prices should produce min_sigma floor."""
         engine = QuoteEngine(make_config())
         seed_prices(engine, [97501.0] * 20)
 
         sigma = engine.calc_volatility()
-        assert sigma == 1.0  # Floor value
+        assert sigma == 8.0  # min_sigma floor (default)
 
     def test_high_volatility(self):
         """Varying prices should produce higher volatility."""
@@ -337,14 +337,14 @@ class TestVolatility:
         assert sigma > 1.0
 
     def test_insufficient_data_default(self):
-        """With < 10 samples, should return default volatility."""
+        """With < 10 samples, should return min_sigma default."""
         engine = QuoteEngine(make_config())
         t = time.time()
         engine.mid_prices.append((t, 97501.0))
         engine.mid_prices.append((t + 1, 97502.0))
 
         sigma = engine.calc_volatility()
-        assert sigma == 5.0  # Default
+        assert sigma == 8.0  # min_sigma default
 
 
 class TestTightenMode:

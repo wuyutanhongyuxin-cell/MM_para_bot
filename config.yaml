@@ -10,13 +10,14 @@ paradex:
 
 # ============ Core Market Making Parameters ============
 strategy:
-  gamma: 0.3                       # Risk aversion coefficient (0.1=aggressive, 0.5=conservative)
+  gamma: 0.5                       # Risk aversion coefficient (0.1=aggressive, 0.5=conservative)
   kappa: 1.5                       # Volatility sensitivity for spread (1.0-3.0)
-  min_half_spread: 1.0             # Minimum half-spread in $ (floor)
+  min_half_spread: 5.0             # Minimum half-spread in $ — data: $1 only captures $0.003/trade
   refresh_interval: 60.0            # Quote refresh interval (seconds) — ~4 ops/cycle, 240/hr < 280 limit
   base_size: 0.0003                # Base order size (BTC) - minimum on Paradex
   max_position: 0.001              # Maximum net position (BTC)
-  vol_window: 60                   # Volatility calculation window (seconds)
+  vol_window: 300                  # Volatility window (seconds) — 60s too short, sigma stuck at floor
+  min_sigma: 8.0                   # Sigma floor ($) — actual BTC σ=$31, prev floor=1.0 was 30x too low
   tick_size: 1.0                   # BTC-USD-PERP tick size ($1)
 
 # ============ OBI (Order Book Imbalance) Overlay ============
@@ -32,9 +33,9 @@ risk:
   max_loss_per_trade: 0.30         # Max loss per single trade ($)
   max_loss_per_hour: 0.50          # Max hourly loss ($)
   max_loss_per_day: 1.00           # Max daily loss ($)
-  inventory_timeout: 120           # Inventory soft timeout (sec) -> tighten spread
-  emergency_timeout: 300           # Inventory hard timeout (sec) -> IOC force close
-  max_unrealized_loss: 0.30        # Max unrealized loss to trigger emergency ($)
+  inventory_timeout: 240           # Inventory soft timeout (sec) — give maker exit more time
+  emergency_timeout: 480           # Inventory hard timeout (sec) — reduce costly IOC frequency
+  max_unrealized_loss: 0.60        # Max unrealized loss ($) — $0.30 triggers on normal $60 BTC move
 
 # ============ Rate Limits (Retail Profile - with safety margin) ============
 rate_limit:

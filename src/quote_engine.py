@@ -49,8 +49,9 @@ class QuoteEngine:
         self.min_half_spread = strategy.get("min_half_spread", 1.0)
         self.base_size = strategy.get("base_size", 0.0003)
         self.max_position = strategy.get("max_position", 0.001)
-        self.vol_window = strategy.get("vol_window", 60)
+        self.vol_window = strategy.get("vol_window", 300)
         self.tick_size = strategy.get("tick_size", 1.0)
+        self.min_sigma = strategy.get("min_sigma", 8.0)
 
         # OBI params
         self.obi_enabled = obi_cfg.get("enabled", True)
@@ -63,7 +64,7 @@ class QuoteEngine:
         self.mid_prices: deque = deque()
         self.vol_time_window: float = float(self.vol_window)  # seconds
         self.obi_smooth: float = 0.0
-        self._last_sigma: float = 5.0  # Default volatility
+        self._last_sigma: float = self.min_sigma  # Default volatility = min_sigma
 
     def update(self, bbo: dict, orderbook: dict = None):
         """Update internal state from market data.
@@ -96,7 +97,7 @@ class QuoteEngine:
         noise from ultra-high-frequency BBO updates.
         """
         if len(self.mid_prices) < 10:
-            return self._last_sigma if self._last_sigma > 0 else 5.0
+            return self._last_sigma if self._last_sigma > 0 else self.min_sigma
 
         prices = [p for _, p in self.mid_prices]
         diffs = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
@@ -106,7 +107,7 @@ class QuoteEngine:
 
         mean = sum(diffs) / len(diffs)
         variance = sum((d - mean) ** 2 for d in diffs) / len(diffs)
-        sigma = max(1.0, math.sqrt(variance))
+        sigma = max(self.min_sigma, math.sqrt(variance))
 
         self._last_sigma = sigma
         return sigma
@@ -256,12 +257,14 @@ class QuoteEngine:
                 result.ask_size = 0
         elif net_pos > 0:
             pos_ratio = net_pos / self.max_position if self.max_position > 0 else 1
-            result.bid_size = self.base_size * max(0, 1 - pos_ratio)
+            # Hard cutoff at 50%: stop adding when half max position reached
+            # Data: all 4 major losses occurred at position >= 0.0045 BTC (45% max)
+            result.bid_size = 0 if pos_ratio >= 0.5 else self.base_size * max(0, 1 - pos_ratio * 2)
             result.ask_size = self.base_size
         elif net_pos < 0:
             pos_ratio = abs(net_pos) / self.max_position if self.max_position > 0 else 1
             result.bid_size = self.base_size
-            result.ask_size = self.base_size * max(0, 1 - pos_ratio)
+            result.ask_size = 0 if pos_ratio >= 0.5 else self.base_size * max(0, 1 - pos_ratio * 2)
         else:
             result.bid_size = self.base_size
             result.ask_size = self.base_size
@@ -275,5 +278,10 @@ class QuoteEngine:
             result.bid_size = min_size
         if 0 < result.ask_size < min_size:
             result.ask_size = min_size
+
+        # Round to lot size precision (5 decimal places)
+        # Fix: SDK rejects sizes not a multiple of 0.00001
+        result.bid_size = round(result.bid_size, 5)
+        result.ask_size = round(result.ask_size, 5)
 
         return result
