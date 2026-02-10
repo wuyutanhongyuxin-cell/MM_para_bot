@@ -508,6 +508,84 @@ class TestMomentumGuard:
         assert result.bid_size > 0
 
 
+class TestVolPause:
+    """Test vol-adaptive pause — pauses quoting when 60s price range exceeds threshold."""
+
+    def _seed_volatile(self, engine, range_dollars=15):
+        """Seed prices with high 60s range (oscillating)."""
+        t = time.time()
+        for i in range(20):
+            price = 97501.0 + (i % 2) * range_dollars
+            engine.mid_prices.append((t + i * 3, price))  # 3s apart, all within 60s
+
+    def _seed_calm(self, engine):
+        """Seed prices with low 60s range (stable)."""
+        t = time.time()
+        for i in range(20):
+            engine.mid_prices.append((t + i * 3, 97501.0 + (i % 2) * 2))  # $2 range
+
+    def test_high_vol_pauses_both_when_flat(self):
+        """When flat and 60s range > threshold, both sides should be paused."""
+        engine = QuoteEngine(make_config(**{"strategy.vol_pause_threshold": 10}))
+        self._seed_volatile(engine, 15)  # $15 range > $10 threshold
+
+        ms = make_market()
+        bs = make_bot(0.0)
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.bid_size == 0
+        assert result.ask_size == 0
+
+    def test_high_vol_keeps_exit_when_long(self):
+        """When long and volatile, entry side paused but exit side kept."""
+        engine = QuoteEngine(make_config(**{"strategy.vol_pause_threshold": 10}))
+        self._seed_volatile(engine, 15)
+
+        ms = make_market()
+        bs = make_bot(0.003)  # Long — ask is exit
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.bid_size == 0   # Entry side paused
+        assert result.ask_size > 0    # Exit side kept
+
+    def test_high_vol_keeps_exit_when_short(self):
+        """When short and volatile, entry side paused but exit side kept."""
+        engine = QuoteEngine(make_config(**{"strategy.vol_pause_threshold": 10}))
+        self._seed_volatile(engine, 15)
+
+        ms = make_market()
+        bs = make_bot(-0.003)  # Short — bid is exit
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.ask_size == 0   # Entry side paused
+        assert result.bid_size > 0    # Exit side kept
+
+    def test_low_vol_no_pause(self):
+        """When 60s range < threshold, no pause should occur."""
+        engine = QuoteEngine(make_config(**{"strategy.vol_pause_threshold": 10}))
+        self._seed_calm(engine)  # $2 range < $10 threshold
+
+        ms = make_market()
+        bs = make_bot(0.0)
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.bid_size > 0
+        assert result.ask_size > 0
+
+    def test_tighten_mode_overrides_vol_pause(self):
+        """Tighten mode should override vol-pause (exit takes priority)."""
+        engine = QuoteEngine(make_config(**{"strategy.vol_pause_threshold": 10}))
+        self._seed_volatile(engine, 15)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(0.003)  # Long
+        bs.tighten_mode = True  # Urgent exit
+
+        result = engine.generate_quotes(ms, bs)
+        # Ask (exit) should be active despite high volatility
+        assert result.ask_size > 0
+
+
 class TestSpreadWidening:
     """Test spread widens with inventory."""
 

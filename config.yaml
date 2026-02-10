@@ -20,6 +20,7 @@ strategy:
   min_sigma: 8.0                   # Sigma floor ($) — actual BTC σ=$31, prev floor=1.0 was 30x too low
   momentum_window: 300             # Momentum lookback window (seconds)
   momentum_threshold: 40           # Price change ($) to trigger trend guard
+  vol_pause_threshold: 10          # If 60s price range > this ($), pause quoting (stale quote protection)
   tick_size: 1.0                   # BTC-USD-PERP tick size ($1)
 
 # ============ OBI (Order Book Imbalance) Overlay ============
@@ -34,7 +35,7 @@ risk:
   max_loss_per_trade: 0.30         # Max loss per single trade ($)
   max_loss_per_hour: 0.50          # Max hourly loss ($)
   max_loss_per_day: 1.00           # Max daily loss ($)
-  inventory_timeout: 240           # Inventory soft timeout (sec) — give maker exit more time
+  inventory_timeout: 120           # Inventory soft timeout (sec) — data: 2-4min holds cause biggest losses
   emergency_timeout: 480           # Inventory hard timeout (sec) — reduce costly IOC frequency
   max_unrealized_loss: 0.60        # Max unrealized loss ($) — $0.30 triggers on normal $60 BTC move
 

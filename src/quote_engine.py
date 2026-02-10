@@ -6,7 +6,7 @@ Core algorithm:
     3. Bid = fair - half_spread (floor to tick), Ask = fair + half_spread (ceil to tick)
     4. Enforce no-crossing: bid <= best_bid, ask >= best_ask
     5. Size skewing based on inventory
-    6. Protective filters: momentum guard + OBI filter (block adverse-side entries)
+    6. Protective filters: vol-pause + momentum guard + OBI filter
 """
 
 import logging
@@ -54,6 +54,7 @@ class QuoteEngine:
         self.min_sigma = strategy.get("min_sigma", 8.0)
         self.momentum_window = strategy.get("momentum_window", 300)
         self.momentum_threshold = strategy.get("momentum_threshold", 40)
+        self.vol_pause_threshold = strategy.get("vol_pause_threshold", 10)
 
         # OBI params
         self.obi_enabled = obi_cfg.get("enabled", True)
@@ -112,6 +113,17 @@ class QuoteEngine:
 
         self._last_sigma = sigma
         return sigma
+
+    def calc_recent_range(self, window_sec: float = 60) -> float:
+        """Price range (high - low) over recent window. Measures absolute volatility."""
+        if len(self.mid_prices) < 2:
+            return 0.0
+        now_ts = self.mid_prices[-1][0]
+        cutoff = now_ts - window_sec
+        prices_in_window = [p for ts, p in self.mid_prices if ts >= cutoff]
+        if len(prices_in_window) < 2:
+            return 0.0
+        return max(prices_in_window) - min(prices_in_window)
 
     def calc_momentum(self) -> float:
         """Price change over momentum window. Positive = rising, negative = falling."""
@@ -278,7 +290,22 @@ class QuoteEngine:
         # Step 7: Protective filters — block entries in adverse direction
         # Skip in tighten_mode: exit takes absolute priority over filters
         if not (bot_state.tighten_mode and net_pos != 0):
-            # 7a: Momentum guard — don't enter trades in trend direction
+            # 7a: Vol-adaptive pause — don't make markets when too volatile
+            # If 60s price range > threshold, stale quotes will be adversely selected
+            recent_range = self.calc_recent_range(60)
+            if recent_range > self.vol_pause_threshold:
+                if net_pos == 0:
+                    result.bid_size = 0
+                    result.ask_size = 0
+                    log.info(f"[VOL-PAUSE] 60s range ${recent_range:.0f} > ${self.vol_pause_threshold}, both sides paused")
+                elif net_pos > 0:
+                    result.bid_size = 0
+                    log.info(f"[VOL-PAUSE] 60s range ${recent_range:.0f}, bid paused (holding long)")
+                else:
+                    result.ask_size = 0
+                    log.info(f"[VOL-PAUSE] 60s range ${recent_range:.0f}, ask paused (holding short)")
+
+            # 7b: Momentum guard — don't enter trades in trend direction
             momentum = self.calc_momentum()
             if abs(momentum) > self.momentum_threshold:
                 if momentum > 0 and net_pos <= 0:
@@ -290,7 +317,7 @@ class QuoteEngine:
                     result.bid_size = 0
                     log.info(f"[MOMENTUM] -${abs(momentum):.0f}/{self.momentum_window}s → bid blocked")
 
-            # 7b: OBI protective filter — block entries in pressure direction
+            # 7c: OBI protective filter — block entries in pressure direction
             if self.obi_enabled and abs(self.obi_smooth) > self.obi_threshold:
                 if self.obi_smooth > 0 and net_pos <= 0:
                     # Buy pressure + flat/short: block ask (don't sell)
