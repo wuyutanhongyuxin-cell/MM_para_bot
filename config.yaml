@@ -1,62 +1,75 @@
 # =============================================================================
-# Paradex BTC-USD-PERP Market Making Bot - Configuration (Pro Mode)
+# Paradex BTC-USD-PERP Market Making Bot - Configuration (Pro Aggressive)
 # =============================================================================
+# Fee breakeven: full_spread > 2 × $97k × 0.00003 = $5.82
+# Target: quotes near top-of-book, maximum fill rate, fast refresh
 
 # ============ Platform Settings ============
 paradex:
   env: "mainnet"                   # mainnet / testnet
   market: "BTC-USD-PERP"
-  profile: "pro"                   # pro (800/s, batch orders, 0.003% maker fee)
+  profile: "pro"                   # pro (800/s, 0.003% maker fee)
 
 # ============ Core Market Making Parameters ============
 strategy:
-  gamma: 0.3                       # Risk aversion (0.1=aggressive, 0.5=conservative) — faster refresh allows lower
-  kappa: 1.5                       # Volatility sensitivity for spread (1.0-3.0)
-  min_half_spread: 5.0             # Minimum half-spread ($) — fee breakeven=$2.91, need buffer
-  refresh_interval: 2.0            # Quote refresh interval (sec) — Pro: no rate limit bottleneck
-  base_size: 0.003                 # Base order size (BTC) — $291 notional, ~$15 margin
-  max_position: 0.01               # Maximum net position (BTC) — $970 notional, ~$49 margin
-  vol_window: 60                   # Volatility window (sec) — shorter for faster refresh
-  min_sigma: 8.0                   # Sigma floor ($)
-  momentum_window: 120             # Momentum lookback (sec) — shorter for faster reaction
-  momentum_threshold: 80           # Price change ($) to trigger trend guard — relaxed (fast refresh = less stale)
-  vol_pause_threshold: 100         # 60s price range ($) to pause quoting — relaxed for Pro speed
+  # -- Spread公式: half_spread = max(min_half_spread, market_spread*0.4 + kappa*sigma)
+  # -- 目标: half_spread ≈ $4-8 (full $8-16), 靠近盘口但覆盖fee
+  gamma: 0.15                      # 低风险厌恶: fair price偏移小, 报价更对称
+                                   # 0.15 × 0.01pos × $30σ² = $1.35 偏移 (温和)
+  kappa: 0.5                       # 关键! 降低波动率对spread的放大
+                                   # σ=$8时: 0.5×8=$4, σ=$30时: 0.5×30=$15
+                                   # 原1.5: σ=$8→$12, σ=$30→$45 (太远)
+  min_half_spread: 4.0             # Fee breakeven=$2.91, buffer=$1.09
+                                   # 极端低波动时的保底: full $8 > $5.82 ✓
+  refresh_interval: 1.0            # 1秒刷新 (Pro: 3 calls/s << 800/s limit)
+                                   # 更快=更少逆向选择=更少报价陈旧
+  base_size: 0.003                 # $291 notional, maker fee=$0.009/fill
+  max_position: 0.01               # $970 notional, ~$49 margin / $500
+  vol_window: 30                   # 30s波动率窗口: 更快反应当前市况
+  min_sigma: 6.0                   # σ下限$6: kappa×6=$3, 但被min_half_spread=$4兜住
+  momentum_window: 60              # 1分钟动量窗口: 快速感知趋势
+  momentum_threshold: 150          # $150才触发动量保护 (BTC 1分钟极少动$150)
+                                   # 几乎不触发=最大化报价时间
+  vol_pause_threshold: 250         # $250才暂停 (只在真正极端行情暂停)
   tick_size: 1.0                   # BTC-USD-PERP tick size ($1)
 
 # ============ OBI (Order Book Imbalance) Overlay ============
 obi:
   enabled: true
-  alpha: 0.3                       # EMA smoothing factor (0=slow, 1=fast)
-  threshold: 0.2                   # Protective filter threshold
-  depth: 5                         # Use top N levels of orderbook
+  alpha: 0.5                       # 更快EMA (0.3→0.5): 快速跟踪orderbook变化
+  threshold: 0.35                  # 提高阈值 (0.2→0.35): 减少误杀
+                                   # 只在强烈失衡时才屏蔽报价
+  depth: 5                         # Top 5 levels
 
 # ============ Risk Management ============
 risk:
-  max_loss_per_trade: 3.00         # Max loss per single trade ($) — 0.01 BTC × $300 move
-  max_loss_per_hour: 10.00         # Max hourly loss ($)
-  max_loss_per_day: 25.00          # Max daily loss ($) — 5% of $500 capital
-  inventory_timeout: 60            # Soft timeout (sec) — faster refresh = faster exit
-  emergency_timeout: 180           # Hard timeout (sec) — force IOC close
-  max_unrealized_loss: 5.00        # Max unrealized loss ($)
-  consecutive_loss_pause: 5        # Pause after N consecutive losing trades
-  consecutive_loss_cooldown: 30    # Cooldown seconds after consecutive loss trigger
-  maker_fee_rate: 0.00003          # Pro: 0.003% (Retail: 0)
-  taker_fee_rate: 0.0002           # Pro: 0.02%  (Retail: 0)
+  max_loss_per_trade: 3.00         # 0.01 BTC × $300 move
+  max_loss_per_hour: 10.00         # 每小时止损
+  max_loss_per_day: 25.00          # 每日止损 = 5% of $500
+  inventory_timeout: 45            # 更紧: 1s刷新下45s已经是45次报价机会
+  emergency_timeout: 120           # 2分钟强平 (原180s)
+  max_unrealized_loss: 5.00        # $5 unrealized loss触发平仓
+  consecutive_loss_pause: 7        # 提高到7次 (原5次太敏感, 2s刷新下连亏5次很常见)
+  consecutive_loss_cooldown: 30    # 30s cooldown
+  maker_fee_rate: 0.00003          # Pro: 0.003%
+  taker_fee_rate: 0.0002           # Pro: 0.02%
 
 # ============ Rate Limits (Pro Profile) ============
 rate_limit:
-  max_orders_per_second: 100       # Pro limit: 800/s (huge margin)
-  max_orders_per_minute: 5000      # Pro limit: 17250/min
+  max_orders_per_second: 100       # Pro: 800/s
+  max_orders_per_minute: 5000      # Pro: 17250/min
   max_orders_per_hour: 50000       # Effectively unlimited
   max_orders_per_day: 500000       # Effectively unlimited
 
 # ============ Trading Schedule (UTC) ============
 schedule:
-  active_hours_utc: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-  pause_hours_utc: [21, 22, 23, 0, 1, 2, 3, 4, 5]
+  active_hours_utc: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  pause_hours_utc: [22, 23, 0, 1, 2, 3, 4]
+                                   # 扩展活跃时间6-20 UTC (覆盖亚洲+欧洲+美国开盘)
+                                   # 只在深夜低流动性时段暂停
 
 # ============ Logging ============
 logging:
   level: "INFO"                    # DEBUG / INFO / WARNING / ERROR
   trade_csv: "trades.csv"          # Trade log file path
-  console_interval: 10             # Status print interval (sec) — more frequent for fast mode
+  console_interval: 10             # Status print interval (sec)

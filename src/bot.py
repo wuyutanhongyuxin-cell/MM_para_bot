@@ -347,7 +347,7 @@ class SpreadCaptureBot:
                 # Check if it's time to refresh quotes
                 now = time.time()
                 if now - last_quote < self.refresh_interval:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.05)  # 50ms poll (not 100ms)
                     continue
 
                 # Check rate limit headroom for new placements
