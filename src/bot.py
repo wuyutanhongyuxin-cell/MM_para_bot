@@ -389,6 +389,7 @@ class SpreadCaptureBot:
         - Only place orders with size > 0
         """
         orders_used = 0
+        cancels_sent = 0
 
         # Hard position cap: block adding-direction orders regardless of quote engine
         current_pos = self.bot_state.net_position
@@ -407,6 +408,7 @@ class SpreadCaptureBot:
                     quotes.bid_price != self.bot_state.open_bid_price):
                 await self.client.cancel_order(self.bot_state.open_bid_id)
                 self.risk_manager.record_order()
+                cancels_sent += 1
                 self.bot_state.open_bid_id = None
                 self.bot_state.open_bid_price = 0.0
 
@@ -415,8 +417,13 @@ class SpreadCaptureBot:
                     quotes.ask_price != self.bot_state.open_ask_price):
                 await self.client.cancel_order(self.bot_state.open_ask_id)
                 self.risk_manager.record_order()
+                cancels_sent += 1
                 self.bot_state.open_ask_id = None
                 self.bot_state.open_ask_price = 0.0
+
+        # Spread cancels and placements across 2 seconds to stay under 3/s limit
+        if cancels_sent > 0:
+            await asyncio.sleep(1.0)
 
         # Place new bid
         if quotes.bid_size > 0 and not self.bot_state.open_bid_id:
