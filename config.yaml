@@ -1,50 +1,52 @@
 # =============================================================================
-# Paradex BTC-USD-PERP Market Making Bot - Configuration
+# Paradex BTC-USD-PERP Market Making Bot - Configuration (Pro Mode)
 # =============================================================================
 
 # ============ Platform Settings ============
 paradex:
   env: "mainnet"                   # mainnet / testnet
   market: "BTC-USD-PERP"
-  profile: "retail"                # retail (0% fee) / pro (batch orders)
+  profile: "pro"                   # pro (800/s, batch orders, 0.003% maker fee)
 
 # ============ Core Market Making Parameters ============
 strategy:
-  gamma: 0.5                       # Risk aversion coefficient (0.1=aggressive, 0.5=conservative)
+  gamma: 0.3                       # Risk aversion (0.1=aggressive, 0.5=conservative) — faster refresh allows lower
   kappa: 1.5                       # Volatility sensitivity for spread (1.0-3.0)
-  min_half_spread: 5.0             # Minimum half-spread in $ — data: $1 only captures $0.003/trade
-  refresh_interval: 60.0            # Quote refresh interval (seconds) — ~4 ops/cycle, 240/hr < 280 limit
-  base_size: 0.0003                # Base order size (BTC) - minimum on Paradex
-  max_position: 0.001              # Maximum net position (BTC)
-  vol_window: 300                  # Volatility window (seconds) — 60s too short, sigma stuck at floor
-  min_sigma: 8.0                   # Sigma floor ($) — actual BTC σ=$31, prev floor=1.0 was 30x too low
-  momentum_window: 300             # Momentum lookback window (seconds)
-  momentum_threshold: 40           # Price change ($) to trigger trend guard
-  vol_pause_threshold: 10          # If 60s price range > this ($), pause quoting (stale quote protection)
+  min_half_spread: 3.0             # Minimum half-spread ($) — RT fee=$0.012 on 0.001 BTC, need >$4 spread
+  refresh_interval: 2.0            # Quote refresh interval (sec) — Pro: no rate limit bottleneck
+  base_size: 0.001                 # Base order size (BTC) — $500 capital supports larger size
+  max_position: 0.003              # Maximum net position (BTC) — ~40% margin at $500
+  vol_window: 60                   # Volatility window (sec) — shorter for faster refresh
+  min_sigma: 8.0                   # Sigma floor ($)
+  momentum_window: 120             # Momentum lookback (sec) — shorter for faster reaction
+  momentum_threshold: 80           # Price change ($) to trigger trend guard — relaxed (fast refresh = less stale)
+  vol_pause_threshold: 100         # 60s price range ($) to pause quoting — relaxed for Pro speed
   tick_size: 1.0                   # BTC-USD-PERP tick size ($1)
 
 # ============ OBI (Order Book Imbalance) Overlay ============
 obi:
   enabled: true
   alpha: 0.3                       # EMA smoothing factor (0=slow, 1=fast)
-  threshold: 0.2                   # Protective filter threshold (lowered: false-stop < false-pass)
+  threshold: 0.2                   # Protective filter threshold
   depth: 5                         # Use top N levels of orderbook
 
 # ============ Risk Management ============
 risk:
-  max_loss_per_trade: 0.30         # Max loss per single trade ($)
-  max_loss_per_hour: 0.50          # Max hourly loss ($)
-  max_loss_per_day: 1.00           # Max daily loss ($)
-  inventory_timeout: 120           # Inventory soft timeout (sec) — data: 2-4min holds cause biggest losses
-  emergency_timeout: 480           # Inventory hard timeout (sec) — reduce costly IOC frequency
-  max_unrealized_loss: 0.60        # Max unrealized loss ($) — $0.30 triggers on normal $60 BTC move
+  max_loss_per_trade: 1.00         # Max loss per single trade ($) — scaled for 0.001 BTC
+  max_loss_per_hour: 3.00          # Max hourly loss ($)
+  max_loss_per_day: 8.00           # Max daily loss ($) — hard stop at $8
+  inventory_timeout: 60            # Soft timeout (sec) — faster refresh = faster exit
+  emergency_timeout: 180           # Hard timeout (sec) — force IOC close
+  max_unrealized_loss: 2.00        # Max unrealized loss ($)
+  consecutive_loss_pause: 5        # Pause after N consecutive losing trades
+  consecutive_loss_cooldown: 30    # Cooldown seconds after consecutive loss trigger
 
-# ============ Rate Limits (Retail Profile - with safety margin) ============
+# ============ Rate Limits (Pro Profile) ============
 rate_limit:
-  max_orders_per_second: 2         # Limit: 3/s, margin: 1
-  max_orders_per_minute: 25        # Limit: 30/min, margin: 5
-  max_orders_per_hour: 280         # Limit: 300/hr, margin: 20
-  max_orders_per_day: 950          # Limit: 1000/day, margin: 50
+  max_orders_per_second: 100       # Pro limit: 800/s (huge margin)
+  max_orders_per_minute: 5000      # Pro limit: 17250/min
+  max_orders_per_hour: 50000       # Effectively unlimited
+  max_orders_per_day: 500000       # Effectively unlimited
 
 # ============ Trading Schedule (UTC) ============
 schedule:
@@ -55,4 +57,4 @@ schedule:
 logging:
   level: "INFO"                    # DEBUG / INFO / WARNING / ERROR
   trade_csv: "trades.csv"          # Trade log file path
-  console_interval: 30             # Status print interval (seconds)
+  console_interval: 10             # Status print interval (sec) — more frequent for fast mode

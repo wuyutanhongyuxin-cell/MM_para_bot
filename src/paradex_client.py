@@ -517,6 +517,69 @@ class ParadexClient:
         log.error("Cannot place order without SDK (signature required)")
         return None
 
+    async def place_batch_orders(self, orders: list) -> list:
+        """Place multiple orders rapidly (Pro mode: 800 req/s).
+
+        Places orders individually via SDK submit_order — at Pro rate limits
+        this is effectively instant and avoids needing to separate sign/submit.
+
+        Args:
+            orders: List of dicts with {side, price, size, instruction, reduce_only}
+
+        Returns:
+            List of order response dicts
+        """
+        results = []
+        for o in orders:
+            r = await self.place_order(
+                side=o["side"],
+                price=o["price"],
+                size=o["size"],
+                instruction=o.get("instruction", "POST_ONLY"),
+                reduce_only=o.get("reduce_only", False),
+            )
+            if r:
+                results.append(r)
+        return results
+
+    async def cancel_batch_orders(self, order_ids: list) -> bool:
+        """Cancel multiple orders in a single batch request (Pro mode).
+
+        Args:
+            order_ids: List of order ID strings to cancel
+
+        Returns:
+            True if request succeeded
+        """
+        if not order_ids:
+            return True
+
+        if self.dry_run:
+            log.info(f"[DRY-RUN] Would batch cancel {len(order_ids)} orders")
+            return True
+
+        # Try REST batch cancel
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as session:
+                url = f"{self.base_url}/orders/batch"
+                headers = self._headers()
+                payload = {"order_ids": order_ids}
+                async with session.delete(url, headers=headers, json=payload) as resp:
+                    if resp.status == 200:
+                        log.debug(f"Batch cancelled {len(order_ids)} orders")
+                        return True
+                    text = await resp.text()
+                    log.warning(f"Batch cancel failed: {resp.status} {text}")
+        except Exception as e:
+            log.error(f"Batch cancel error: {e}")
+
+        # Fallback: cancel individually
+        for oid in order_ids:
+            await self.cancel_order(oid)
+        return True
+
     async def cancel_order(self, order_id: str, market: str = None) -> bool:
         """Cancel a single order by ID."""
         if self.dry_run:

@@ -27,6 +27,17 @@ class RiskManager:
         self.inventory_timeout = risk_cfg.get("inventory_timeout", 120)
         self.emergency_timeout = risk_cfg.get("emergency_timeout", 300)
 
+        # Consecutive loss circuit breaker
+        self.consecutive_loss_pause = risk_cfg.get("consecutive_loss_pause", 5)
+        self.consecutive_loss_cooldown = risk_cfg.get("consecutive_loss_cooldown", 30)
+        self._consecutive_losses: int = 0
+        self._loss_pause_until: float = 0.0
+
+        # Fee tracking (Pro: maker 0.003% = 0.3bps, taker 0.02% = 2bps)
+        self.total_fees: float = 0.0
+        self.maker_fee_rate: float = 0.00003   # 0.003%
+        self.taker_fee_rate: float = 0.0002    # 0.02%
+
         # Rate limits
         self.limits = {
             "second": rate_cfg.get("max_orders_per_second", 2),
@@ -93,14 +104,19 @@ class RiskManager:
             self._current_day = now_utc.date()
             self.daily_pnl = 0.0
 
-        # 3. PnL limits
+        # 3. Consecutive loss circuit breaker
+        if time.time() < self._loss_pause_until:
+            remaining = self._loss_pause_until - time.time()
+            return False, f"consecutive_loss_cooldown ({remaining:.0f}s left)"
+
+        # 4. PnL limits
         if self.hourly_pnl < -self.max_loss_per_hour:
             return False, f"hourly_loss_limit (${self.hourly_pnl:.2f})"
 
         if self.daily_pnl < -self.max_loss_per_day:
             return False, f"daily_loss_limit (${self.daily_pnl:.2f})"
 
-        # 4. Rate limits (check all windows)
+        # 5. Rate limits (check all windows)
         for window in ["second", "minute", "hour", "day"]:
             count = self._count_in_window(window)
             if count >= self.limits[window]:
@@ -160,6 +176,28 @@ class RiskManager:
         self.hourly_pnl += realized_pnl
         self.daily_pnl += realized_pnl
 
+        # Consecutive loss tracking (only count closing trades with nonzero PnL)
+        if realized_pnl < 0:
+            self._consecutive_losses += 1
+            if self._consecutive_losses >= self.consecutive_loss_pause:
+                cooldown = self.consecutive_loss_cooldown
+                if self._consecutive_losses >= self.consecutive_loss_pause * 2:
+                    cooldown *= 10  # 10x cooldown for double the threshold
+                self._loss_pause_until = time.time() + cooldown
+                log.warning(
+                    f"[CIRCUIT BREAKER] {self._consecutive_losses} consecutive losses, "
+                    f"pausing {cooldown}s"
+                )
+        elif realized_pnl > 0:
+            self._consecutive_losses = 0
+
+    def record_fee(self, notional: float, is_maker: bool = True):
+        """Record fee for a fill (maker or taker rate)."""
+        rate = self.maker_fee_rate if is_maker else self.taker_fee_rate
+        fee = notional * rate
+        self.total_fees += fee
+        return fee
+
     def get_usage(self) -> dict:
         """Return current rate limit usage for status display."""
         return {
@@ -167,6 +205,8 @@ class RiskManager:
             "minute": self._count_in_window("minute"),
             "hour": self._count_in_window("hour"),
             "day": self._count_in_window("day"),
+            "fees": self.total_fees,
+            "consecutive_losses": self._consecutive_losses,
         }
 
     def is_active_hour(self) -> bool:

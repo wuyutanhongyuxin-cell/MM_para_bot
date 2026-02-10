@@ -251,9 +251,9 @@ class SpreadCaptureBot:
         log.info("Main loop started")
         last_quote = 0.0
         last_orderbook_fetch = 0.0
-        orderbook_interval = 10.0  # Fetch orderbook every 10s for OBI
+        orderbook_interval = 5.0  # Fetch orderbook every 5s for OBI (Pro: GET 120/s)
         last_reconcile = 0.0
-        reconcile_interval = 10.0  # REST position reconciliation every 10s
+        reconcile_interval = 5.0  # REST position reconciliation every 5s
         last_timeout_log = 0.0
         timeout_log_interval = 30.0  # Debounce timeout log to 30s
 
@@ -396,13 +396,9 @@ class SpreadCaptureBot:
     async def cancel_and_requote(self, quotes):
         """Cancel existing orders and place new bid/ask.
 
-        Minimizes order count to respect rate limits:
-        - Only cancel if prices have changed
-        - Only place orders with size > 0
+        Pro mode: cancel_all + rapid place (no inter-op delay).
+        At 800 req/s, 3 API calls (1 cancel_all + 2 place) is negligible.
         """
-        orders_used = 0
-        cancels_sent = 0
-
         # Hard position cap: block adding-direction orders regardless of quote engine
         current_pos = self.bot_state.net_position
         if current_pos >= self.max_position:
@@ -414,31 +410,32 @@ class SpreadCaptureBot:
                 log.info(f"[POSITION CAP] Short {current_pos:+.4f} >= max {self.max_position}, ask blocked")
                 quotes.ask_size = 0
 
-        # Cancel existing bid if price changed or no longer needed
-        if self.bot_state.open_bid_id:
-            if (quotes.bid_size == 0 or
-                    quotes.bid_price != self.bot_state.open_bid_price):
-                await self.client.cancel_order(self.bot_state.open_bid_id)
-                self.risk_manager.record_order()
-                cancels_sent += 1
-                self.bot_state.open_bid_id = None
-                self.bot_state.open_bid_price = 0.0
+        # Check if quotes actually changed — skip cancel+place cycle if identical
+        bid_unchanged = (
+            self.bot_state.open_bid_id
+            and quotes.bid_size > 0
+            and quotes.bid_price == self.bot_state.open_bid_price
+        )
+        ask_unchanged = (
+            self.bot_state.open_ask_id
+            and quotes.ask_size > 0
+            and quotes.ask_price == self.bot_state.open_ask_price
+        )
+        if bid_unchanged and ask_unchanged:
+            log.debug("[QUOTE] Prices unchanged, skipping requote")
+            return
 
-        if self.bot_state.open_ask_id:
-            if (quotes.ask_size == 0 or
-                    quotes.ask_price != self.bot_state.open_ask_price):
-                await self.client.cancel_order(self.bot_state.open_ask_id)
-                self.risk_manager.record_order()
-                cancels_sent += 1
-                self.bot_state.open_ask_id = None
-                self.bot_state.open_ask_price = 0.0
+        # Cancel all existing orders in one call
+        if self.bot_state.open_bid_id or self.bot_state.open_ask_id:
+            await self.client.cancel_all(self.market_name)
+            self.risk_manager.record_order()  # 1 API call
+            self.bot_state.open_bid_id = None
+            self.bot_state.open_bid_price = 0.0
+            self.bot_state.open_ask_id = None
+            self.bot_state.open_ask_price = 0.0
 
-        # Spread cancels and placements across 2 seconds to stay under 3/s limit
-        if cancels_sent > 0:
-            await asyncio.sleep(1.0)
-
-        # Place new bid
-        if quotes.bid_size > 0 and not self.bot_state.open_bid_id:
+        # Place new bid (no delay — Pro mode has no speed throttle)
+        if quotes.bid_size > 0:
             result = await self.client.place_order(
                 side="BUY",
                 price=quotes.bid_price,
@@ -449,14 +446,13 @@ class SpreadCaptureBot:
                 self.bot_state.open_bid_id = result.get("id")
                 self.bot_state.open_bid_price = quotes.bid_price
                 self.risk_manager.record_order()
-                orders_used += 1
                 log.info(
                     f"[BID] {quotes.bid_size:.4f} @ ${quotes.bid_price:.0f} "
                     f"(fair=${quotes.fair_price:.1f} obi={quotes.obi:+.2f})"
                 )
 
         # Place new ask
-        if quotes.ask_size > 0 and not self.bot_state.open_ask_id:
+        if quotes.ask_size > 0:
             result = await self.client.place_order(
                 side="SELL",
                 price=quotes.ask_price,
@@ -467,7 +463,6 @@ class SpreadCaptureBot:
                 self.bot_state.open_ask_id = result.get("id")
                 self.bot_state.open_ask_price = quotes.ask_price
                 self.risk_manager.record_order()
-                orders_used += 1
                 log.info(
                     f"[ASK] {quotes.ask_size:.4f} @ ${quotes.ask_price:.0f} "
                     f"(fair=${quotes.fair_price:.1f} obi={quotes.obi:+.2f})"
@@ -590,6 +585,10 @@ class SpreadCaptureBot:
         # Determine if maker or taker
         is_maker = fill.get("liquidity", "").upper() == "MAKER"
         fill_type = "maker" if is_maker else "taker"
+
+        # Track fees (Pro: 0.003% maker, 0.02% taker)
+        notional = price * size
+        fee = self.risk_manager.record_fee(notional, is_maker=is_maker)
 
         # Update PnL tracker (for PnL math only, NOT position authority)
         summary = self.pnl_tracker.on_fill(side, price, size)
@@ -761,7 +760,7 @@ class SpreadCaptureBot:
         log.info(f"  Paradex Market Making Bot [{mode}]")
         log.info("=" * 60)
         log.info(f"  Market:     {self.market_name}")
-        log.info(f"  Profile:    {profile} ({'0% fees' if profile == 'RETAIL' else 'batch orders'})")
+        log.info(f"  Profile:    {profile} ({'0% fees' if profile == 'RETAIL' else '0.003% maker / 0.02% taker'})")
         log.info(f"  Env:        {paradex_cfg.get('env', 'mainnet')}")
         log.info(f"  Base Size:  {self.base_size} BTC")
         log.info(f"  Max Pos:    {self.max_position} BTC")
@@ -899,4 +898,6 @@ class SpreadCaptureBot:
         log.info(f"  Maker Fills:    {self.bot_state.maker_fills}/{self.bot_state.total_trades}")
         rate_usage = self.risk_manager.get_usage()
         log.info(f"  Orders Used:    {rate_usage['day']}/day")
+        log.info(f"  Total Fees:     ${rate_usage['fees']:.4f}")
+        log.info(f"  Net PnL:        ${stats['total_pnl'] - rate_usage['fees']:+.4f} (after fees)")
         log.info("=" * 60)

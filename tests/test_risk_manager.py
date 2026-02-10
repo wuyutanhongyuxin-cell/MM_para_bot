@@ -187,6 +187,101 @@ class TestUnrealizedLoss:
         assert rm.check_unrealized_loss(0.50) is False
 
 
+class TestConsecutiveLossBreaker:
+    """Test consecutive loss circuit breaker."""
+
+    def _make_rm(self, pause=3, cooldown=10):
+        cfg = make_config()
+        cfg["risk"]["consecutive_loss_pause"] = pause
+        cfg["risk"]["consecutive_loss_cooldown"] = cooldown
+        # All hours active for testing
+        cfg["schedule"]["active_hours_utc"] = list(range(24))
+        cfg["schedule"]["pause_hours_utc"] = []
+        return RiskManager(cfg)
+
+    def test_no_breaker_under_threshold(self):
+        """Should not trigger breaker with fewer losses than threshold."""
+        rm = self._make_rm(pause=5)
+        for _ in range(4):
+            rm.update_pnl(-0.10)
+        assert rm._consecutive_losses == 4
+        assert rm._loss_pause_until == 0.0
+
+    def test_breaker_triggers_at_threshold(self):
+        """Should trigger cooldown at exactly N consecutive losses."""
+        rm = self._make_rm(pause=3, cooldown=10)
+        for _ in range(3):
+            rm.update_pnl(-0.10)
+        assert rm._consecutive_losses == 3
+        assert rm._loss_pause_until > time.time()
+        ok, reason = rm.can_trade()
+        assert not ok
+        assert "consecutive_loss_cooldown" in reason
+
+    def test_win_resets_counter(self):
+        """A winning trade should reset consecutive loss counter."""
+        rm = self._make_rm(pause=5)
+        rm.update_pnl(-0.10)
+        rm.update_pnl(-0.10)
+        assert rm._consecutive_losses == 2
+        rm.update_pnl(0.05)
+        assert rm._consecutive_losses == 0
+
+    def test_double_threshold_10x_cooldown(self):
+        """Double the threshold should trigger 10x cooldown."""
+        rm = self._make_rm(pause=3, cooldown=10)
+        for _ in range(6):  # 2x threshold
+            rm.update_pnl(-0.10)
+        # Should have 10x cooldown = 100s
+        assert rm._loss_pause_until > time.time() + 90
+
+    def test_cooldown_expires(self):
+        """After cooldown expires, trading should resume."""
+        rm = self._make_rm(pause=3, cooldown=1)
+        for _ in range(3):
+            rm.update_pnl(-0.10)
+        # Force expire cooldown
+        rm._loss_pause_until = time.time() - 1
+        ok, reason = rm.can_trade()
+        # Should not be blocked by consecutive_loss_cooldown
+        assert "consecutive_loss_cooldown" not in reason
+
+
+class TestFeeTracking:
+    """Test fee recording and tracking."""
+
+    def test_record_maker_fee(self):
+        """Should calculate and accumulate maker fees (0.003%)."""
+        rm = RiskManager(make_config())
+        fee1 = rm.record_fee(100_000, is_maker=True)  # $100k notional
+        assert fee1 == pytest.approx(3.0)  # 0.003% of $100k = $3
+        fee2 = rm.record_fee(50_000, is_maker=True)
+        assert fee2 == pytest.approx(1.5)
+        assert rm.total_fees == pytest.approx(4.5)
+
+    def test_record_taker_fee(self):
+        """Should calculate taker fees (0.02%)."""
+        rm = RiskManager(make_config())
+        fee = rm.record_fee(100_000, is_maker=False)
+        assert fee == pytest.approx(20.0)  # 0.02% of $100k = $20
+
+    def test_fees_in_usage(self):
+        """Fees should appear in usage dict."""
+        rm = RiskManager(make_config())
+        rm.record_fee(100_000, is_maker=True)
+        usage = rm.get_usage()
+        assert "fees" in usage
+        assert usage["fees"] == pytest.approx(3.0)
+
+    def test_consecutive_losses_in_usage(self):
+        """Consecutive loss count should appear in usage dict."""
+        rm = RiskManager(make_config())
+        rm.update_pnl(-0.10)
+        rm.update_pnl(-0.10)
+        usage = rm.get_usage()
+        assert usage["consecutive_losses"] == 2
+
+
 class TestSchedule:
     """Test time-based schedule filtering."""
 
