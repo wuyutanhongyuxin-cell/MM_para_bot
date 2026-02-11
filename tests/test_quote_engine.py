@@ -390,7 +390,7 @@ class TestVolWindowGuard:
 
 
 class TestVolatility:
-    """Test volatility calculation (EWMA × Rogers-Satchell)."""
+    """Test volatility calculation (EWMA × Rogers-Satchell on 5s candles)."""
 
     def test_no_data_returns_min_sigma(self):
         """Before any data, vol engine should return min_sigma."""
@@ -399,57 +399,71 @@ class TestVolatility:
         assert sigma == 8.0  # min_sigma floor (default)
 
     def test_stable_prices_returns_min_sigma(self):
-        """Stable prices within 1-second candle should stay at min_sigma."""
+        """Stable prices within one 5s candle should stay at min_sigma."""
         engine = QuoteEngine(make_config())
-        # All prices identical → H==L → candle skipped → min_sigma
-        t = time.time()
+        # All prices identical → H==L → close-to-close fallback needs prev_close
+        t = 1000000.0  # Aligned to 5s boundary
         for i in range(20):
-            engine.vol_engine.update(97501.0, t + i * 0.05)
+            engine.vol_engine.update(97501.0, t + i * 0.2)
         sigma = engine.calc_volatility()
-        assert sigma == 8.0
+        assert sigma == 8.0  # No candle closed yet or cc return = 0
 
     def test_volatile_prices_above_min(self):
-        """Oscillating prices across 1-second candles should produce sigma > min."""
+        """Oscillating prices across 5-second candles should produce sigma > min."""
         engine = QuoteEngine(make_config())
-        t = 1000000.0  # Aligned integer timestamp
-        # Create multiple 1-second candles with meaningful OHLC variation
-        # O, H, L, C must all be different for RS to be non-trivial
-        for sec in range(5):
-            engine.vol_engine.update(97000.0, t + sec)          # Open
-            engine.vol_engine.update(97080.0, t + sec + 0.2)    # High
-            engine.vol_engine.update(96920.0, t + sec + 0.5)    # Low (below open)
-            engine.vol_engine.update(97040.0, t + sec + 0.8)    # Close
-        # Close last candle
-        engine.vol_engine.update(97000.0, t + 6)
+        t = 1000000.0  # Aligned to 5s boundary
+        # Create multiple 5-second candles with meaningful OHLC variation
+        for candle_idx in range(5):
+            base = t + candle_idx * 5
+            engine.vol_engine.update(97000.0, base)          # Open
+            engine.vol_engine.update(97080.0, base + 1.0)    # High
+            engine.vol_engine.update(96920.0, base + 2.5)    # Low
+            engine.vol_engine.update(97040.0, base + 4.0)    # Close
+        # Close last candle by starting new one
+        engine.vol_engine.update(97000.0, t + 30)
         sigma = engine.calc_volatility()
         assert sigma > 8.0  # Should be well above min_sigma
 
     def test_insufficient_candles_returns_min(self):
         """With only 1 candle (not yet closed), should return min_sigma."""
         engine = QuoteEngine(make_config())
-        t = time.time()
+        t = 1000000.0
         engine.vol_engine.update(97500.0, t)
-        engine.vol_engine.update(97520.0, t + 0.5)
-        # Still in first candle (same second), not closed yet
+        engine.vol_engine.update(97520.0, t + 2.0)
+        # Still in first 5s candle, not closed yet
         sigma = engine.calc_volatility()
         assert sigma == 8.0
 
+    def test_cc_fallback_when_h_equals_l(self):
+        """When all candles have H==L (1 tick each), close-to-close fallback kicks in."""
+        engine = QuoteEngine(make_config())
+        t = 1000000.0
+        # Each 5s candle has exactly 1 tick → H==L → RS skipped
+        # But close-to-close (log(C/C_prev))² provides variance
+        engine.vol_engine.update(97000.0, t)           # candle 0: single tick
+        engine.vol_engine.update(97050.0, t + 5)       # candle 1: cc return $50
+        engine.vol_engine.update(96950.0, t + 10)      # candle 2: cc return -$100
+        engine.vol_engine.update(97100.0, t + 15)      # candle 3: cc return $150
+        engine.vol_engine.update(96900.0, t + 20)      # candle 4: closes candle 3
+        sigma = engine.calc_volatility()
+        # With $50-150 moves between candles, sigma should exceed min_sigma
+        assert sigma > 8.0
+
 
 class TestVolatilityEngine:
-    """Direct tests for VolatilityEngine (EWMA × Rogers-Satchell)."""
+    """Direct tests for VolatilityEngine (EWMA × Rogers-Satchell, 5s candles)."""
 
     def test_rs_variance_correctness(self):
         """Verify RS variance formula: v = ln(H/C)·ln(H/O) + ln(L/C)·ln(L/O)."""
         ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
-        # Use aligned integer timestamps to avoid bucket misalignment
-        t = 1000000.0
-        # Create a 1-second candle: O=97000, H=97050, L=96950, C=97010
+        t = 1000000.0  # Aligned to 5s boundary
+        # Create a 5-second candle: O=97000, H=97050, L=96950, C=97010
         ve.update(97000.0, t)       # Open
-        ve.update(97050.0, t + 0.2) # High
-        ve.update(96950.0, t + 0.4) # Low
-        ve.update(97010.0, t + 0.6) # Close
-        # Close candle by starting new second
-        ve.update(97005.0, t + 1.0)
+        ve.update(97050.0, t + 1.0) # High
+        ve.update(96950.0, t + 2.5) # Low
+        ve.update(97010.0, t + 4.0) # Close
+        # Close candle by starting next 5s bucket
+        ve.update(97005.0, t + 5.0)
 
         # Manually compute expected RS variance
         O, H, L, C = 97000.0, 97050.0, 96950.0, 97010.0
@@ -463,24 +477,27 @@ class TestVolatilityEngine:
     def test_ewma_decay(self):
         """After a volatile candle, sigma should decay toward min with calm candles."""
         ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
-        t = 1000000.0  # Aligned integer timestamp
+        t = 1000000.0  # Aligned to 5s boundary
 
-        # 1 volatile candle ($200 range)
+        # 1 volatile 5s candle ($200 range)
         ve.update(97000.0, t)
-        ve.update(97100.0, t + 0.2)
-        ve.update(96900.0, t + 0.5)
-        ve.update(97050.0, t + 0.8)
+        ve.update(97100.0, t + 1.0)
+        ve.update(96900.0, t + 2.5)
+        ve.update(97050.0, t + 4.0)
 
-        # Close and start calm candles ($4 range each)
+        # Close and start calm 5s candles ($4 range each)
         sigma_after_spike = None
-        for sec in range(1, 20):
-            ve.update(97000.0, t + sec)
-            ve.update(97002.0, t + sec + 0.2)
-            ve.update(96998.0, t + sec + 0.5)
-            ve.update(97001.0, t + sec + 0.8)
-            if sec == 1:
+        for candle_idx in range(1, 10):
+            base = t + candle_idx * 5
+            ve.update(97000.0, base)
+            ve.update(97002.0, base + 1.0)
+            ve.update(96998.0, base + 2.5)
+            ve.update(97001.0, base + 4.0)
+            if candle_idx == 1:
                 sigma_after_spike = ve.get_sigma()
 
+        # Close last calm candle
+        ve.update(97000.0, t + 55)
         sigma_decayed = ve.get_sigma()
         # Sigma should have decayed significantly
         if sigma_after_spike and sigma_after_spike > 1.0:
@@ -489,51 +506,74 @@ class TestVolatilityEngine:
     def test_responds_to_spike(self):
         """Sigma should increase after a volatility spike."""
         ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
-        # Use aligned integer timestamps
-        t = 1000000.0
+        t = 1000000.0  # Aligned to 5s boundary
 
-        # Several calm candles first ($5 range)
-        for sec in range(5):
-            ve.update(97000.0, t + sec)
-            ve.update(97005.0, t + sec + 0.3)
-            ve.update(96995.0, t + sec + 0.6)
-            ve.update(97002.0, t + sec + 0.9)
+        # Several calm 5s candles first ($5 range)
+        for candle_idx in range(3):
+            base = t + candle_idx * 5
+            ve.update(97000.0, base)
+            ve.update(97005.0, base + 1.5)
+            ve.update(96995.0, base + 3.0)
+            ve.update(97002.0, base + 4.5)
 
         sigma_calm = ve.get_sigma()
 
-        # Multiple spike candles ($400 range) — λ=0.94 means each contributes 6%,
-        # so need several spike candles for sigma to increase meaningfully
-        for spike_offset in range(3):
-            spike_sec = 6 + spike_offset
-            ve.update(97000.0, t + spike_sec)
-            ve.update(97200.0, t + spike_sec + 0.2)
-            ve.update(96800.0, t + spike_sec + 0.5)
-            ve.update(97050.0, t + spike_sec + 0.8)
+        # Multiple spike 5s candles ($400 range)
+        for spike_idx in range(3):
+            base = t + (3 + spike_idx) * 5
+            ve.update(97000.0, base)
+            ve.update(97200.0, base + 1.0)
+            ve.update(96800.0, base + 2.5)
+            ve.update(97050.0, base + 4.0)
 
         # Close last spike candle
-        ve.update(97000.0, t + 10.0)
+        ve.update(97000.0, t + 35)
         sigma_spike = ve.get_sigma()
 
-        # With 3 spike candles (6% contribution each ≈ 17% total weight),
-        # sigma should increase noticeably
+        # With 3 spike candles, sigma should increase noticeably
         assert sigma_spike > sigma_calm * 1.5
 
     def test_min_sigma_floor(self):
         """Sigma should never go below min_sigma."""
         ve = VolatilityEngine(lambda_=0.94, min_sigma=8.0)
-        t = 1000000.0  # Aligned integer timestamp
+        t = 1000000.0
 
-        # Tiny range candles ($2)
-        for sec in range(10):
-            ve.update(97000.0, t + sec)
-            ve.update(97001.0, t + sec + 0.2)
-            ve.update(96999.0, t + sec + 0.5)
-            ve.update(97000.0, t + sec + 0.8)
+        # Tiny range 5s candles ($2)
+        for candle_idx in range(5):
+            base = t + candle_idx * 5
+            ve.update(97000.0, base)
+            ve.update(97001.0, base + 1.0)
+            ve.update(96999.0, base + 2.5)
+            ve.update(97000.0, base + 4.0)
 
         # Close last candle
-        ve.update(97000.0, t + 11)
+        ve.update(97000.0, t + 30)
         sigma = ve.get_sigma()
         assert sigma >= 8.0
+
+    def test_cc_fallback_initializes(self):
+        """Close-to-close fallback should initialize EWMA when RS cannot."""
+        ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+        t = 1000000.0
+        # Single-tick 5s candles (H==L) → RS fails, cc fallback used
+        ve.update(97000.0, t)           # candle 0: 1 tick, prev_close=0
+        ve.update(97100.0, t + 5)       # candle 1: closes candle 0, cc=$100 return
+        ve.update(96900.0, t + 10)      # candle 2: closes candle 1, cc=-$200 return
+        assert ve._initialized  # Should be initialized via cc fallback
+        sigma = ve.get_sigma()
+        assert sigma > 1.0  # cc returns should produce meaningful sigma
+
+    def test_5s_bucketing(self):
+        """Timestamps within same 5s window should belong to same candle."""
+        ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+        t = 1000000.0  # Exact 5s boundary
+        ve.update(97000.0, t)        # t=0s
+        ve.update(97010.0, t + 1.0)  # t=1s, same candle
+        ve.update(97020.0, t + 2.5)  # t=2.5s, same candle
+        ve.update(97005.0, t + 4.9)  # t=4.9s, same candle
+        assert ve._candle_count == 4
+        assert ve._candle_high == 97020.0
+        assert ve._candle_low == 97000.0
 
 
 class TestTightenMode:

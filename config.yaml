@@ -14,17 +14,21 @@ paradex:
 # ============ Core Market Making Parameters ============
 strategy:
   # -- Spread公式: half_spread = max(min_half_spread, spread×spread_factor + kappa×sigma)
-  # -- 目标: half_spread ≈ $7-12 (full $14-24), 距BBO 4-8层
-  # -- 教训: sigma永远卡在min_sigma→half=min_half_spread→必须足够宽
-  # -- 日志实证: BTC每秒动$3-5, half<$7会被系统性逆选
+  # -- 目标: half_spread ≈ $10-16 (full $20-32), 距BBO 3-8tick
+  # -- 修复: sigma现在动态(5秒K线RS+EWMA), kappa×sigma真正驱动spread
+  # -- 数据: avg逆选$8.3/BTC, $10 half能覆盖正常逆选, 高波动时自动加宽
   gamma: 0.03                      # 归一化仓位后: 0.03×(q/q_max)×σ²
                                    # 50%仓位σ=$12: $2.2偏移(2tick), 100%仓位σ=$20: $12(12tick)
                                    # 学术参考: GLFT 2013, AS 2008 (normalized inventory)
-  kappa: 0.40                      # σ>10时开始贡献: 0.4×15=$6, 0.4×20=$8
+  kappa: 0.60                      # σ>10时贡献: 0.6×13=$7.8(正常), 0.6×20=$12(高波)
+                                   # 修复: 0.40太低→kappa×sigma<min_half→spread永远=min
+                                   # 0.60让AS模型的动态spread真正生效
+                                   # 学术: AS(2008) spread∝kappa×sigma, kappa吸收时间尺度
   spread_factor: 0.30              # 市场spread系数
-  min_half_spread: 7.0             # 核心防线! 日志证明$4-5太紧
-                                   # full $14 vs breakeven $5.82 = $8.18安全边际
-                                   # BTC 0.5s动$2-3, $7 half能扛住绝大多数
+  min_half_spread: 10.0            # 核心防线! 实测avg_loss=$8.3/BTC逆向移动
+                                   # full $20 vs breakeven $5.82 = $14安全边际
+                                   # Tiniç&Sensoy(2023): BTC逆选2-5bps, $10≈3bps/side
+                                   # 比$7多3tick缓冲, 在BBO后3-4tick处报价
   refresh_interval: 0.5            # 0.5秒刷新: 逆选窗口减半
                                    # 6 API/s << 800/s Pro limit
   base_size: 0.003                 # $291 notional, maker fee=$0.009/fill

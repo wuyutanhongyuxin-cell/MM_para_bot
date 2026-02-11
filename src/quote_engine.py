@@ -8,9 +8,11 @@ Core algorithm:
     5. Size skewing based on inventory
     6. Protective filters: vol-pause + momentum guard + OBI filter
 
-Volatility: EWMA × Rogers-Satchell on 1-second OHLC candles.
+Volatility: EWMA × Rogers-Satchell on 5-second OHLC candles.
+    - 5s candles: accumulate 5-10 BBO ticks (vs 1s→H==L→sigma stuck at min)
     - Rogers & Satchell (1991): ~6x more efficient than close-to-close, handles drift
-    - RiskMetrics (1996): EWMA λ=0.94, industry standard for financial vol estimation
+    - Yang-Zhang (2000): close-to-close fallback when H==L (no intrabar range)
+    - RiskMetrics (1996): EWMA λ=0.94, ~55s half-life at 5s candles
 """
 
 import logging
@@ -26,25 +28,37 @@ log = logging.getLogger("MM-BOT")
 
 
 class VolatilityEngine:
-    """EWMA × Rogers-Satchell volatility estimator on 1-second OHLC candles.
+    """EWMA × Rogers-Satchell volatility estimator on 5-second OHLC candles.
+
+    Changed from 1-second to 5-second candles because Paradex BBO arrives at
+    ~1-2 ticks/sec → 1s candles almost always have H==L → RS variance = 0
+    → sigma stuck at min_sigma permanently. 5s candles accumulate 5-10 ticks,
+    giving RS meaningful intrabar range.
 
     Academic basis:
-        - Rogers & Satchell (1991): RS variance handles non-zero drift (BTC trends),
-          ~6x more efficient than close-to-close estimator.
-        - RiskMetrics (1996): EWMA with λ=0.94 (~11s half-life) is the industry
-          standard for financial time-series volatility smoothing.
-        - Yang-Zhang (2000) rejected: its overnight-gap component adds noise
-          for 24/7 BTC markets with no session boundaries.
+        - Rogers & Satchell (1991): RS variance handles non-zero drift,
+          ~6x more efficient than close-to-close. Requires H != L.
+        - Garman & Klass (1980): Range-based estimators degenerate with
+          insufficient intrabar ticks ("finite transaction volume bias").
+        - Yang-Zhang (2000): Close-to-close variance is a valid fallback
+          when range data is unavailable (H==L). Used as fallback here.
+        - RiskMetrics (1996): EWMA with λ=0.94 (~11 candles half-life).
+          At 5s candles = ~55s half-life, responsive enough for MM.
 
-    Output: dollar-denominated sigma per second (same units as spread formula).
+    Output: dollar-denominated sigma per candle period (used directly in
+    spread formula: half_spread = kappa × sigma). The kappa parameter
+    absorbs the time-scale factor.
     """
+
+    CANDLE_PERIOD = 5  # seconds per candle
 
     def __init__(self, lambda_: float = 0.94, min_sigma: float = 8.0):
         self.lambda_ = lambda_
         self.min_sigma = min_sigma
         self.ewma_variance: float = 0.0
         self._initialized: bool = False
-        # Current 1-second candle
+        self._prev_close: float = 0.0  # For close-to-close fallback
+        # Current candle
         self._candle_start: int = 0
         self._candle_open: float = 0.0
         self._candle_high: float = 0.0
@@ -54,7 +68,7 @@ class VolatilityEngine:
 
     def update(self, price: float, timestamp: float) -> float:
         """Feed a mid-price tick. Returns current dollar sigma estimate."""
-        bucket = int(timestamp)
+        bucket = int(timestamp) // self.CANDLE_PERIOD
 
         if self._candle_start == 0:
             self._init_candle(bucket, price)
@@ -63,8 +77,7 @@ class VolatilityEngine:
         if bucket == self._candle_start:
             self._update_candle(price)
         else:
-            if self._candle_count >= 2:
-                self._close_candle()
+            self._close_candle()
             self._init_candle(bucket, price)
 
         return self.get_sigma()
@@ -84,34 +97,50 @@ class VolatilityEngine:
         self._candle_count += 1
 
     def _close_candle(self):
-        """Close candle → compute RS variance → update EWMA."""
+        """Close candle → compute variance → update EWMA.
+
+        Uses Rogers-Satchell when H != L (range-based, handles drift).
+        Falls back to close-to-close squared log-return when H == L
+        (Yang-Zhang 2000: cc variance is valid baseline estimator).
+        """
         O = self._candle_open
         H = self._candle_high
         L = self._candle_low
         C = self._candle_close
 
-        if O <= 0 or H == L:
+        if O <= 0 or C <= 0:
             return
 
-        # Rogers-Satchell: v = ln(H/C)·ln(H/O) + ln(L/C)·ln(L/O)
-        ln_hc = math.log(H / C)
-        ln_ho = math.log(H / O)
-        ln_lc = math.log(L / C)
-        ln_lo = math.log(L / O)
-        rs_var = ln_hc * ln_ho + ln_lc * ln_lo
-        rs_var = max(0.0, rs_var)  # Noisy data can yield negative
+        var_estimate = None
 
-        if not self._initialized:
-            self.ewma_variance = rs_var
-            self._initialized = True
-        else:
-            self.ewma_variance = (
-                self.lambda_ * self.ewma_variance
-                + (1 - self.lambda_) * rs_var
-            )
+        if H > L and self._candle_count >= 2:
+            # Rogers-Satchell: v = ln(H/C)·ln(H/O) + ln(L/C)·ln(L/O)
+            ln_hc = math.log(H / C)
+            ln_ho = math.log(H / O)
+            ln_lc = math.log(L / C)
+            ln_lo = math.log(L / O)
+            var_estimate = ln_hc * ln_ho + ln_lc * ln_lo
+            var_estimate = max(0.0, var_estimate)
+        elif self._prev_close > 0:
+            # Close-to-close fallback: (log(C/C_prev))²
+            # Ref: Yang-Zhang (2000), Garman-Klass (1980) baseline
+            log_return = math.log(C / self._prev_close)
+            var_estimate = log_return * log_return
+
+        if var_estimate is not None:
+            if not self._initialized:
+                self.ewma_variance = var_estimate
+                self._initialized = True
+            else:
+                self.ewma_variance = (
+                    self.lambda_ * self.ewma_variance
+                    + (1 - self.lambda_) * var_estimate
+                )
+
+        self._prev_close = C
 
     def get_sigma(self) -> float:
-        """Return current dollar sigma (per-second volatility)."""
+        """Return current dollar sigma (per-candle-period volatility)."""
         if not self._initialized:
             return self.min_sigma
         price = self._candle_close if self._candle_close > 0 else 97000.0
@@ -212,9 +241,9 @@ class QuoteEngine:
     def calc_volatility(self) -> float:
         """Return current dollar sigma from EWMA × Rogers-Satchell engine.
 
-        The VolatilityEngine builds 1-second OHLC candles from BBO mid prices
+        The VolatilityEngine builds 5-second OHLC candles from BBO mid prices
         and computes Rogers-Satchell variance with EWMA smoothing (λ=0.94).
-        This replaces the naive tick-diff stddev which was stuck at min_sigma.
+        Falls back to close-to-close when H==L (insufficient intrabar range).
         """
         sigma = self.vol_engine.get_sigma()
         self._last_sigma = sigma

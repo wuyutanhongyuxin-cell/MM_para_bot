@@ -697,10 +697,18 @@ class SpreadCaptureBot:
         # Update PnL tracker (for PnL math only, NOT position authority)
         summary = self.pnl_tracker.on_fill(side, price, size)
 
-        # DO NOT set net_position from PnLTracker — it tracks independently from
-        # zero and will conflict with the exchange-reported position from WS callback
-        # and REST reconciliation. Position authority is: WS _on_position_update + REST.
-        # Position entry time tracking is also handled by _apply_position_update.
+        # Apply immediate position delta from this fill.
+        # Before this fix: on_fill() did NOT update position → relied entirely on
+        # WS position channel which lags fills → 51% mismatch rate (392/768 fills
+        # in Log2). Wrong position → wrong inventory skewing → wrong quote direction.
+        # The WS position channel uses SET (absolute), not increment, so when it
+        # arrives later it simply overrides this delta with the correct value.
+        # REST reconciliation (every 2s + after each fill) provides final correction.
+        if side == "BUY":
+            self.bot_state.net_position += size
+        elif side == "SELL":
+            self.bot_state.net_position -= size
+
         self.bot_state.total_trades += 1
         if is_maker:
             self.bot_state.maker_fills += 1
