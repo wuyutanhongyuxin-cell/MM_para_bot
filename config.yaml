@@ -1,7 +1,7 @@
 # =============================================================================
 # Paradex BTC-USD-PERP Market Making Bot - Configuration (Pro Balanced)
 # =============================================================================
-# Fee breakeven: full_spread > 2 × $97k × 0.00003 = $5.82
+# Fee breakeven: full_spread > 2 × price × 0.00003 (e.g. $100k → $6.00)
 # 平衡策略: 宽spread保护 + 0.5s快刷新 + 积极过滤器
 # half_spread = max(min_half_spread, spread × spread_factor + kappa × sigma)
 
@@ -29,7 +29,9 @@ strategy:
                                    # 6 API/s << 800/s Pro limit
   base_size: 0.003                 # $291 notional, maker fee=$0.009/fill
   max_position: 0.01               # $970 notional, ~$49 margin / $500
-  vol_window: 20                   # 20s波动率窗口
+  vol_window: 60                   # 60s数据窗口 (必须>=max(momentum_window,60))
+                                   # 修复: 20s时momentum_window=45s和vol_pause的60s窗口被截断
+                                   # 内存: 40tick/s × 60s = 2400条 × 16byte = 38KB
   min_sigma: 10.0                  # 关键修复! 原5.0导致sigma永远=5→kappa失效
                                    # 10.0让kappa×10=$4开始有贡献
                                    # 被min_half=$7兜住, 所以下限是$7不是$4
@@ -70,10 +72,11 @@ rate_limit:
 
 # ============ Trading Schedule (UTC) ============
 schedule:
-  active_hours_utc: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  active_hours_utc: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
   pause_hours_utc: [22, 23, 0, 1, 2, 3, 4]
-                                   # 扩展活跃时间6-20 UTC (覆盖亚洲+欧洲+美国开盘)
-                                   # 只在深夜低流动性时段暂停
+                                   # 活跃时间5-21 UTC (覆盖亚洲+欧洲+美国全日)
+                                   # 只在深夜低流动性时段暂停 (22-04 UTC)
+                                   # 注意: 所有24小时必须在active或pause中, 无遗漏
 
 # ============ Logging ============
 logging:

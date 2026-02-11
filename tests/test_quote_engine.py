@@ -352,6 +352,43 @@ class TestNoCrossingBBO:
         assert result.ask_price >= ms.best_ask
 
 
+class TestVolWindowGuard:
+    """vol_window must be >= max(momentum_window, 60) to avoid truncation."""
+
+    def test_vol_window_auto_corrects_when_too_small(self):
+        """vol_window < momentum_window should be auto-corrected."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.vol_window": 20,
+            "strategy.momentum_window": 45,
+        }))
+        # Auto-corrected to max(45, 60) = 60
+        assert engine.vol_window >= 60
+        assert engine.vol_time_window >= 60
+
+    def test_vol_window_ok_when_large_enough(self):
+        """vol_window >= max(momentum_window, 60) should stay as-is."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.vol_window": 90,
+            "strategy.momentum_window": 45,
+        }))
+        assert engine.vol_window == 90
+
+    def test_momentum_uses_full_window(self):
+        """Momentum should use the full momentum_window of data, not truncated."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.vol_window": 60,
+            "strategy.momentum_window": 45,
+            "strategy.momentum_threshold": 100,
+        }))
+        t = time.time()
+        # Seed 50s of data: slow uptrend $1/s = $45 over 45s
+        for i in range(50):
+            engine.mid_prices.append((t + i, 97500.0 + i))
+        # Momentum over 45s should be ~$45 (not truncated to 20s = $20)
+        momentum = engine.calc_momentum()
+        assert momentum > 40  # Full 45s window used
+
+
 class TestVolatility:
     """Test volatility calculation (EWMA × Rogers-Satchell)."""
 

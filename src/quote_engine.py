@@ -165,6 +165,18 @@ class QuoteEngine:
         # Volatility engine: EWMA × Rogers-Satchell (replaces naive stddev)
         self.vol_engine = VolatilityEngine(lambda_=0.94, min_sigma=self.min_sigma)
 
+        # Enforce: vol_window must hold enough data for momentum and vol_pause
+        # calc_momentum() needs momentum_window seconds of data
+        # calc_recent_range(60) needs 60 seconds of data
+        min_required = max(self.momentum_window, 60)
+        if self.vol_window < min_required:
+            log.warning(
+                f"vol_window={self.vol_window}s < required {min_required}s "
+                f"(momentum_window={self.momentum_window}s, vol_pause=60s). "
+                f"Auto-correcting to {min_required}s."
+            )
+            self.vol_window = min_required
+
         # State — mid_prices stores (timestamp, price) tuples
         self.mid_prices: deque = deque()
         self.vol_time_window: float = float(self.vol_window)  # seconds
