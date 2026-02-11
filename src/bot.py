@@ -260,7 +260,11 @@ class SpreadCaptureBot:
         last_orderbook_fetch = 0.0
         orderbook_interval = 5.0  # Fetch orderbook every 5s for OBI (Pro: GET 120/s)
         last_reconcile = 0.0
-        reconcile_interval = 5.0  # REST position reconciliation every 5s
+        reconcile_interval = 2.0  # REST position reconciliation every 2s
+        # Data: 8 mismatches in 19min at 5s interval, 7 with sign flips.
+        # Wrong-direction quoting for up to 5s per event → doubled losses.
+        # 2s reduces max wrong-direction window by 60%.
+        # Cost: 0.5 GET/s << Pro 120 GET/s limit.
         last_timeout_log = 0.0
         timeout_log_interval = 30.0  # Debounce timeout log to 30s
 
@@ -703,24 +707,26 @@ class SpreadCaptureBot:
             self.bot_state.open_ask_id = None
             self.bot_state.open_ask_price = 0.0
 
-        # Fix F: Cancel adding-direction orders when position > 50% max
-        if abs(self.bot_state.net_position) >= self.max_position * 0.5:
-            if self.bot_state.net_position > 0 and self.bot_state.open_bid_id:
-                log.info("[RISK] Position heavy long, cancelling bid")
-                try:
-                    await self.client.cancel_order(self.bot_state.open_bid_id)
-                except Exception as e:
-                    log.debug(f"Cancel bid failed: {e}")
-                self.bot_state.open_bid_id = None
-                self.bot_state.open_bid_price = 0.0
-            elif self.bot_state.net_position < 0 and self.bot_state.open_ask_id:
-                log.info("[RISK] Position heavy short, cancelling ask")
-                try:
-                    await self.client.cancel_order(self.bot_state.open_ask_id)
-                except Exception as e:
-                    log.debug(f"Cancel ask failed: {e}")
-                self.bot_state.open_ask_id = None
-                self.bot_state.open_ask_price = 0.0
+        # Cancel ALL remaining orders after any fill.
+        # After a fill, the remaining order reflects the pre-fill fair price
+        # and is mispriced due to inventory change (gamma*inv_ratio*sigma²).
+        # Data: avg_loss=2.4x avg_win (229 fills, 19min), stale opposite-side
+        # orders are the primary source of adverse selection.
+        # Ref: Guilbaud & Pham (2013) — optimal MM adjusts all quotes after fill.
+        # Ref: Cartea & Jaimungal (2015) — inventory-dependent optimal quotes
+        # must update immediately when inventory changes.
+        # Pro cost: 1 cancel_all per fill ≈ 12/min << 800/s limit.
+        remaining_id = self.bot_state.open_bid_id or self.bot_state.open_ask_id
+        if remaining_id:
+            log.debug("[FILL-CANCEL] Cancelling stale orders after fill")
+            try:
+                await self.client.cancel_all(self.market_name)
+            except Exception as e:
+                log.debug(f"Post-fill cancel failed: {e}")
+            self.bot_state.open_bid_id = None
+            self.bot_state.open_bid_price = 0.0
+            self.bot_state.open_ask_id = None
+            self.bot_state.open_ask_price = 0.0
 
         # Log — show exchange position (bot_state), not PnLTracker position
         rpnl = summary["realized_pnl"]
@@ -745,6 +751,13 @@ class SpreadCaptureBot:
             bid_quote=self.bot_state.open_bid_price,
             ask_quote=self.bot_state.open_ask_price,
         )
+
+        # Post-fill forced reconciliation: verify position with REST
+        # Data: 8 mismatches in 19min (7 sign flips) because WS position
+        # updates lag behind fills. Without this, bot quotes wrong direction
+        # for up to 5s (now 2s with reduced interval, but immediate is better).
+        # Cost: 1 GET /positions per fill ≈ 12/min << 120 GET/s limit.
+        await self._reconcile_position()
 
     async def _handle_order_update(self, order: dict):
         """Handle order status changes (POST_ONLY rejection, etc.)."""
