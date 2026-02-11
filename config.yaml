@@ -1,8 +1,8 @@
 # =============================================================================
-# Paradex BTC-USD-PERP Market Making Bot - Configuration (Pro Optimal)
+# Paradex BTC-USD-PERP Market Making Bot - Configuration (Pro Balanced)
 # =============================================================================
 # Fee breakeven: full_spread > 2 × $97k × 0.00003 = $5.82
-# Optimal: quotes 1-4层 from BBO, maximum fill rate, 1s refresh
+# 平衡策略: 宽spread保护 + 0.5s快刷新 + 积极过滤器
 # half_spread = max(min_half_spread, spread × spread_factor + kappa × sigma)
 
 # ============ Platform Settings ============
@@ -14,35 +14,39 @@ paradex:
 # ============ Core Market Making Parameters ============
 strategy:
   # -- Spread公式: half_spread = max(min_half_spread, spread×spread_factor + kappa×sigma)
-  # -- 目标: half_spread ≈ $4-8 (full $8-16), 距BBO 1-4层
-  gamma: 0.10                      # 低风险厌恶: fair price偏移更平滑
-                                   # 0.10 × 0.01pos × $20σ² = $0.40 偏移 (极温和)
-  kappa: 0.30                      # 核心参数: 波动率放大器降至最优
-                                   # σ=$10: 0.3×10=$3 (min_half兜底=$4)
-                                   # σ=$15: 0.3×15=$4.5, σ=$20: 0.3×20=$6
-                                   # σ=$30: 0.3×30=$9 (vs原0.5×30=$15, 省40%)
-  spread_factor: 0.25              # 市场spread系数 (原0.4硬编码)
-                                   # spread=$6时: 0.25×6=$1.5 (vs原0.4×6=$2.4)
-                                   # 1s刷新下宽spread≠高风险, 可以降低
-  min_half_spread: 4.0             # Fee breakeven=$2.91, buffer=$1.09
-                                   # 保底: full $8 > $5.82 breakeven ✓
-  refresh_interval: 1.0            # 1秒刷新 (Pro: 3 calls/s << 800/s limit)
+  # -- 目标: half_spread ≈ $5-10 (full $10-20), 距BBO 3-8层
+  # -- 教训: half<$5时1s刷新的逆向选择成本>spread收益
+  gamma: 0.12                      # 温和库存惩罚: 偏移够用但不过激
+                                   # 0.12 × 0.01pos × $20σ² = $0.48 偏移
+  kappa: 0.40                      # 平衡点: 0.30太紧(逆选), 0.50太远(无成交)
+                                   # σ=$10: 0.4×10=$4 (min_half兜底=$5)
+                                   # σ=$15: 0.4×15=$6, σ=$20: 0.4×20=$8
+                                   # σ=$30: 0.4×30=$12 (合理距离)
+  spread_factor: 0.30              # 市场spread系数: 0.25太紧, 0.40太松
+                                   # spread=$6: 0.30×6=$1.8, 温和贡献
+  min_half_spread: 5.0             # Fee breakeven=$2.91, buffer=$2.09
+                                   # full $10 vs breakeven $5.82 = $4.18安全边际
+                                   # 1s内BTC平均动$2-5, $5 half能抗住大部分
+  refresh_interval: 0.5            # 0.5秒刷新! 关键改进: 逆选窗口减半
+                                   # 6 API/s << 800/s Pro limit
+                                   # 报价更新更快=被吃掉的概率更低
   base_size: 0.003                 # $291 notional, maker fee=$0.009/fill
   max_position: 0.01               # $970 notional, ~$49 margin / $500
-  vol_window: 20                   # 20s波动率窗口: 更快反应当前市况
-  min_sigma: 5.0                   # σ下限$5: kappa×5=$1.5, 被min_half=$4兜住
-  momentum_window: 45              # 45s动量窗口: 快速感知趋势
-  momentum_threshold: 200          # $200才触发 (BTC 45s动$200 = 年化几次)
-                                   # 最大化报价时间, 几乎不触发
-  vol_pause_threshold: 300         # $300才暂停 (只在极端黑天鹅暂停)
+  vol_window: 20                   # 20s波动率窗口: 快速反应
+  min_sigma: 5.0                   # σ下限$5, 被min_half=$5兜住
+  momentum_window: 45              # 45s动量窗口
+  momentum_threshold: 120          # $120触发保护 (比200更积极保护)
+                                   # BTC 45s动$120 = 每天几次, 值得避开
+  vol_pause_threshold: 200         # $200暂停 (比300更积极保护)
+                                   # 60s内$200波动 = 明确的高危行情
   tick_size: 1.0                   # BTC-USD-PERP tick size ($1)
 
 # ============ OBI (Order Book Imbalance) Overlay ============
 obi:
   enabled: true
   alpha: 0.5                       # 快速EMA跟踪orderbook变化
-  threshold: 0.40                  # 高阈值: 只在明确的失衡时才屏蔽
-                                   # 0.35→0.40: 减少误杀, 更多报价时间
+  threshold: 0.30                  # 回调到0.30: 更积极地过滤有毒订单流
+                                   # 30%失衡 = 明确的方向性信号, 该避开
   depth: 5                         # Top 5 levels
 
 # ============ Risk Management ============
@@ -50,11 +54,11 @@ risk:
   max_loss_per_trade: 3.00         # 0.01 BTC × $300 move
   max_loss_per_hour: 10.00         # 每小时止损
   max_loss_per_day: 25.00          # 每日止损 = 5% of $500
-  inventory_timeout: 45            # 45s = 45次报价机会 @ 1s刷新
-  emergency_timeout: 120           # 2分钟强平
-  max_unrealized_loss: 5.00        # $5 unrealized loss触发平仓
-  consecutive_loss_pause: 7        # 7次连亏才触发circuit breaker
-  consecutive_loss_cooldown: 30    # 30s cooldown
+  inventory_timeout: 30            # 30s = 60次报价机会 @ 0.5s刷新
+  emergency_timeout: 90            # 90秒强平 (0.5s刷新下=180次报价机会)
+  max_unrealized_loss: 4.00        # $4 unrealized loss触发平仓 (更紧, 快止损)
+  consecutive_loss_pause: 5        # 5次连亏触发breaker (更敏感, 快暂停)
+  consecutive_loss_cooldown: 60    # 60s cooldown (暂停久一点, 等市况变化)
   maker_fee_rate: 0.00003          # Pro: 0.003%
   taker_fee_rate: 0.0002           # Pro: 0.02%
 
