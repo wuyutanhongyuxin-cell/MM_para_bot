@@ -427,21 +427,27 @@ class QuoteEngine:
         # Step 7: Protective filters — block entries in adverse direction
         # Skip in tighten_mode: exit takes absolute priority over filters
         if not (bot_state.tighten_mode and net_pos != 0):
-            # 7a: Vol-adaptive pause — don't make markets when too volatile
-            # If 60s price range > threshold, stale quotes will be adversely selected
+            # 7a: Vol-adaptive pause — don't make markets when range is abnormally high
+            # Dynamic threshold: max(base, 2.5 × sigma × √12)
+            # With dynamic sigma, kappa×sigma already widens spread during high vol.
+            # Vol-pause should only trigger for structural breaks (range >> expected).
+            # Expected 60s range ≈ sigma × √(60/5) = sigma × √12 for 5s candles.
+            # Multiplier 2.5 = only pause when range is 2.5× expected (anomalous).
             recent_range = self.calc_recent_range(60)
-            if recent_range > self.vol_pause_threshold:
+            expected_range = sigma * math.sqrt(12)  # 12 candles in 60s
+            dynamic_threshold = max(self.vol_pause_threshold, 2.5 * expected_range)
+            if recent_range > dynamic_threshold:
                 result.vol_paused = True
                 if net_pos == 0:
                     result.bid_size = 0
                     result.ask_size = 0
-                    log.info(f"[VOL-PAUSE] 60s range ${recent_range:.0f} > ${self.vol_pause_threshold}, both sides paused")
+                    log.info(f"[VOL-PAUSE] 60s range ${recent_range:.0f} > ${dynamic_threshold:.0f} (2.5×E[R]), both sides paused")
                 elif net_pos > 0:
                     result.bid_size = 0
-                    log.info(f"[VOL-PAUSE] 60s range ${recent_range:.0f}, bid paused (holding long)")
+                    log.info(f"[VOL-PAUSE] 60s range ${recent_range:.0f} > ${dynamic_threshold:.0f}, bid paused (holding long)")
                 else:
                     result.ask_size = 0
-                    log.info(f"[VOL-PAUSE] 60s range ${recent_range:.0f}, ask paused (holding short)")
+                    log.info(f"[VOL-PAUSE] 60s range ${recent_range:.0f} > ${dynamic_threshold:.0f}, ask paused (holding short)")
 
             # 7b: Momentum guard — don't enter trades in trend direction
             momentum = self.calc_momentum()

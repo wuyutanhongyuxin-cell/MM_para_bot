@@ -727,8 +727,11 @@ class TestMomentumGuard:
 class TestVolPause:
     """Test vol-adaptive pause — pauses quoting when 60s price range exceeds threshold."""
 
-    def _seed_volatile(self, engine, range_dollars=15):
-        """Seed prices with high 60s range (oscillating)."""
+    def _seed_volatile(self, engine, range_dollars=80):
+        """Seed prices with high 60s range (oscillating).
+        Default $80 exceeds dynamic threshold max(base, 2.5×sigma×√12).
+        With min_sigma=8: dynamic_threshold ≈ $69, so $80 triggers pause.
+        """
         t = time.time()
         for i in range(20):
             price = 97501.0 + (i % 2) * range_dollars
@@ -741,9 +744,9 @@ class TestVolPause:
             engine.mid_prices.append((t + i * 3, 97501.0 + (i % 2) * 2))  # $2 range
 
     def test_high_vol_pauses_both_when_flat(self):
-        """When flat and 60s range > threshold, both sides should be paused."""
+        """When flat and 60s range > dynamic threshold, both sides should be paused."""
         engine = QuoteEngine(make_config(**{"strategy.vol_pause_threshold": 10}))
-        self._seed_volatile(engine, 15)  # $15 range > $10 threshold
+        self._seed_volatile(engine)  # $80 range > dynamic ~$69
 
         ms = make_market()
         bs = make_bot(0.0)
@@ -755,7 +758,7 @@ class TestVolPause:
     def test_high_vol_keeps_exit_when_long(self):
         """When long and volatile, entry side paused but exit side kept."""
         engine = QuoteEngine(make_config(**{"strategy.vol_pause_threshold": 10}))
-        self._seed_volatile(engine, 15)
+        self._seed_volatile(engine)
 
         ms = make_market()
         bs = make_bot(0.003)  # Long — ask is exit
@@ -767,7 +770,7 @@ class TestVolPause:
     def test_high_vol_keeps_exit_when_short(self):
         """When short and volatile, entry side paused but exit side kept."""
         engine = QuoteEngine(make_config(**{"strategy.vol_pause_threshold": 10}))
-        self._seed_volatile(engine, 15)
+        self._seed_volatile(engine)
 
         ms = make_market()
         bs = make_bot(-0.003)  # Short — bid is exit
@@ -791,7 +794,7 @@ class TestVolPause:
     def test_tighten_mode_overrides_vol_pause(self):
         """Tighten mode should override vol-pause (exit takes priority)."""
         engine = QuoteEngine(make_config(**{"strategy.vol_pause_threshold": 10}))
-        self._seed_volatile(engine, 15)
+        self._seed_volatile(engine)
 
         ms = make_market(97500.0, 97502.0)
         bs = make_bot(0.003)  # Long
