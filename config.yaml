@@ -14,39 +14,36 @@ paradex:
 # ============ Core Market Making Parameters ============
 strategy:
   # -- Spread公式: half_spread = max(min_half_spread, spread×spread_factor + kappa×sigma)
-  # -- 目标: half_spread ≈ $5-10 (full $10-20), 距BBO 3-8层
-  # -- 教训: half<$5时1s刷新的逆向选择成本>spread收益
-  gamma: 0.12                      # 温和库存惩罚: 偏移够用但不过激
-                                   # 0.12 × 0.01pos × $20σ² = $0.48 偏移
-  kappa: 0.40                      # 平衡点: 0.30太紧(逆选), 0.50太远(无成交)
-                                   # σ=$10: 0.4×10=$4 (min_half兜底=$5)
-                                   # σ=$15: 0.4×15=$6, σ=$20: 0.4×20=$8
-                                   # σ=$30: 0.4×30=$12 (合理距离)
-  spread_factor: 0.30              # 市场spread系数: 0.25太紧, 0.40太松
-                                   # spread=$6: 0.30×6=$1.8, 温和贡献
-  min_half_spread: 5.0             # Fee breakeven=$2.91, buffer=$2.09
-                                   # full $10 vs breakeven $5.82 = $4.18安全边际
-                                   # 1s内BTC平均动$2-5, $5 half能抗住大部分
-  refresh_interval: 0.5            # 0.5秒刷新! 关键改进: 逆选窗口减半
+  # -- 目标: half_spread ≈ $7-12 (full $14-24), 距BBO 4-8层
+  # -- 教训: sigma永远卡在min_sigma→half=min_half_spread→必须足够宽
+  # -- 日志实证: BTC每秒动$3-5, half<$7会被系统性逆选
+  gamma: 0.12                      # 温和库存惩罚
+  kappa: 0.40                      # σ>10时开始贡献: 0.4×15=$6, 0.4×20=$8
+  spread_factor: 0.30              # 市场spread系数
+  min_half_spread: 7.0             # 核心防线! 日志证明$4-5太紧
+                                   # full $14 vs breakeven $5.82 = $8.18安全边际
+                                   # BTC 0.5s动$2-3, $7 half能扛住绝大多数
+  refresh_interval: 0.5            # 0.5秒刷新: 逆选窗口减半
                                    # 6 API/s << 800/s Pro limit
-                                   # 报价更新更快=被吃掉的概率更低
   base_size: 0.003                 # $291 notional, maker fee=$0.009/fill
   max_position: 0.01               # $970 notional, ~$49 margin / $500
-  vol_window: 20                   # 20s波动率窗口: 快速反应
-  min_sigma: 5.0                   # σ下限$5, 被min_half=$5兜住
+  vol_window: 20                   # 20s波动率窗口
+  min_sigma: 10.0                  # 关键修复! 原5.0导致sigma永远=5→kappa失效
+                                   # 10.0让kappa×10=$4开始有贡献
+                                   # 被min_half=$7兜住, 所以下限是$7不是$4
   momentum_window: 45              # 45s动量窗口
-  momentum_threshold: 120          # $120触发保护 (比200更积极保护)
-                                   # BTC 45s动$120 = 每天几次, 值得避开
-  vol_pause_threshold: 200         # $200暂停 (比300更积极保护)
-                                   # 60s内$200波动 = 明确的高危行情
+  momentum_threshold: 60           # $60触发 (日志: $25/6s=$250/min趋势, 45s≈$30)
+                                   # $60能抓住中等强度趋势, 不会太频繁
+  vol_pause_threshold: 120         # $120暂停 (日志: 60s范围$80就已经很危险)
+                                   # 降低到$120可以在波动初期就暂停
   tick_size: 1.0                   # BTC-USD-PERP tick size ($1)
 
 # ============ OBI (Order Book Imbalance) Overlay ============
 obi:
   enabled: true
   alpha: 0.5                       # 快速EMA跟踪orderbook变化
-  threshold: 0.30                  # 回调到0.30: 更积极地过滤有毒订单流
-                                   # 30%失衡 = 明确的方向性信号, 该避开
+  threshold: 0.20                  # 日志实证: OBI=-0.23时就应该拦住
+                                   # 20%失衡 = 足够明确的方向性信号
   depth: 5                         # Top 5 levels
 
 # ============ Risk Management ============
