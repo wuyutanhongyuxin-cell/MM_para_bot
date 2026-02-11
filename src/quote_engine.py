@@ -427,18 +427,23 @@ class QuoteEngine:
         # Step 7: Protective filters — block entries in adverse direction
         # Skip in tighten_mode: exit takes absolute priority over filters
         if not (bot_state.tighten_mode and net_pos != 0):
+            # CRITICAL: treat near-flat positions as flat for ALL filter decisions.
+            # Bug found: pos=-0.0003 (one base unit) was treated as "short" → OBI/momentum
+            # guards didn't block bid → bot bought $68376 into a $170 selloff → -$0.4495 loss.
+            # A position smaller than base_size cannot meaningfully benefit from directional
+            # moves, so it should be treated as flat (block BOTH sides on signal).
+            is_effectively_flat = abs(net_pos) < self.base_size
+
             # 7a: Vol-adaptive pause — don't make markets when range is abnormally high
             # Dynamic threshold: max(base, 2.5 × sigma × √12)
             # With dynamic sigma, kappa×sigma already widens spread during high vol.
             # Vol-pause should only trigger for structural breaks (range >> expected).
-            # Expected 60s range ≈ sigma × √(60/5) = sigma × √12 for 5s candles.
-            # Multiplier 2.5 = only pause when range is 2.5× expected (anomalous).
             recent_range = self.calc_recent_range(60)
             expected_range = sigma * math.sqrt(12)  # 12 candles in 60s
             dynamic_threshold = max(self.vol_pause_threshold, 2.5 * expected_range)
             if recent_range > dynamic_threshold:
                 result.vol_paused = True
-                if net_pos == 0:
+                if is_effectively_flat:
                     result.bid_size = 0
                     result.ask_size = 0
                     log.info(f"[VOL-PAUSE] 60s range ${recent_range:.0f} > ${dynamic_threshold:.0f} (2.5×E[R]), both sides paused")
@@ -452,31 +457,38 @@ class QuoteEngine:
             # 7b: Momentum guard — don't enter trades in trend direction
             momentum = self.calc_momentum()
             if abs(momentum) > self.momentum_threshold:
-                if momentum > 0 and net_pos <= 0:
-                    # Uptrend + flat/short: block ask (don't sell into rally)
+                if is_effectively_flat:
+                    # Flat + any trend: block BOTH sides (no directional entry)
+                    result.bid_size = 0
+                    result.ask_size = 0
+                    log.info(f"[MOMENTUM] ${momentum:+.0f}/{self.momentum_window}s → both blocked (flat)")
+                elif momentum > 0 and net_pos < 0:
+                    # Uptrend + short: block ask (don't sell into rally)
                     result.ask_size = 0
                     log.info(f"[MOMENTUM] +${momentum:.0f}/{self.momentum_window}s → ask blocked")
-                elif momentum < 0 and net_pos >= 0:
-                    # Downtrend + flat/long: block bid (don't buy into selloff)
+                elif momentum < 0 and net_pos > 0:
+                    # Downtrend + long: block bid (don't buy into selloff)
                     result.bid_size = 0
                     log.info(f"[MOMENTUM] -${abs(momentum):.0f}/{self.momentum_window}s → bid blocked")
 
             # 7c: OBI protective filter — block entries in pressure direction
             if self.obi_enabled and abs(self.obi_smooth) > self.obi_threshold:
-                if self.obi_smooth > 0 and net_pos <= 0:
-                    # Buy pressure + flat/short: block ask (don't sell)
+                if is_effectively_flat:
+                    # Flat + OBI signal: block BOTH sides
+                    result.bid_size = 0
+                    result.ask_size = 0
+                    log.info(f"[OBI-GUARD] |{self.obi_smooth:+.2f}| > threshold → both blocked (flat)")
+                elif self.obi_smooth > 0 and net_pos < 0:
+                    # Buy pressure + short: block ask (don't sell)
                     result.ask_size = 0
                     log.info(f"[OBI-GUARD] buy pressure {self.obi_smooth:+.2f} → ask blocked")
-                elif self.obi_smooth < 0 and net_pos >= 0:
-                    # Sell pressure + flat/long: block bid (don't buy)
+                elif self.obi_smooth < 0 and net_pos > 0:
+                    # Sell pressure + long: block bid (don't buy)
                     result.bid_size = 0
                     log.info(f"[OBI-GUARD] sell pressure {self.obi_smooth:+.2f} → bid blocked")
 
-            # 7d: Flat guard — one-sided entry when flat = directional bet, NOT market making
-            # A flat market maker must quote BOTH sides (spread capture) or NEITHER.
-            # Ref: Cartea et al. (2015) Ch.10 — protective filters should only be
-            # one-sided when there's an existing position to protect.
-            if abs(net_pos) < 0.0001:  # below min_size 0.0003 = effectively flat
+            # 7d: Flat guard — safety net for any remaining one-sided entries
+            if is_effectively_flat:
                 if (result.bid_size == 0) != (result.ask_size == 0):
                     result.bid_size = 0
                     result.ask_size = 0

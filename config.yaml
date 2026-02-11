@@ -29,8 +29,10 @@ strategy:
                                    # full $20 vs breakeven $5.82 = $14安全边际
                                    # Tiniç&Sensoy(2023): BTC逆选2-5bps, $10≈3bps/side
                                    # 比$7多3tick缓冲, 在BBO后3-4tick处报价
-  refresh_interval: 0.5            # 0.5秒刷新: 逆选窗口减半
-                                   # 6 API/s << 800/s Pro limit
+  refresh_interval: 3.0             # 3秒刷新: 减少逆选曝光频率6x
+                                   # 0.5s时10.8fills/min→每填单只有0.5s对冲窗口
+                                   # 3s时~1.8fills/min→每填单有3s对冲窗口
+                                   # 2 API/cycle × 0.33/s = 0.67/s << 800/s Pro limit
   base_size: 0.003                 # $291 notional, maker fee=$0.009/fill
   max_position: 0.01               # $970 notional, ~$49 margin / $500
   vol_window: 60                   # 60s数据窗口 (必须>=max(momentum_window,60))

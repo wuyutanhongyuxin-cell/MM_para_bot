@@ -264,6 +264,30 @@ class TestOBIProtectiveFilter:
         # Ask should NOT be blocked (we're long, ask = exit direction)
         assert result.ask_size > 0
 
+    def test_obi_blocks_both_when_near_flat(self):
+        """REGRESSION: pos=-0.0003 (< base_size) treated as flat, not 'short'.
+        Bug: OBI=-0.478 + pos=-0.0003 → guards treated as 'short' → bid allowed
+        → bot bought $68376 into a $170 selloff → -$0.4495 single loss.
+        Fix: abs(net_pos) < base_size → treat as flat → block BOTH sides.
+        """
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        # Sell pressure OBI
+        bids = [(97500 - i, 1.0) for i in range(5)]
+        asks = [(97502 + i, 10.0) for i in range(5)]
+        for _ in range(10):
+            engine.calc_obi(bids, asks)
+
+        ms = make_market()
+        # Position is tiny (< base_size=0.001) — effectively flat
+        bs = make_bot(-0.0003)
+        result = engine.generate_quotes(ms, bs)
+
+        # BOTH sides should be blocked (effectively flat + OBI signal)
+        assert result.bid_size == 0
+        assert result.ask_size == 0
+
     def test_obi_below_threshold_no_filter(self):
         """OBI below threshold should not filter any side."""
         engine = QuoteEngine(make_config(**{"obi.threshold": 0.3}))
@@ -690,6 +714,27 @@ class TestMomentumGuard:
         result = engine.generate_quotes(ms, bs)
 
         assert result.bid_size > 0  # NOT blocked
+
+    def test_downtrend_blocks_both_when_near_flat(self):
+        """REGRESSION: tiny short position (-0.0003) should be treated as flat.
+        With old code: downtrend + pos=-0.0003 → bid allowed → adverse selection.
+        """
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 30,
+            "strategy.momentum_window": 300,
+        }))
+        t = time.time()
+        for i in range(20):
+            engine.mid_prices.append((t + i * 15, 97501.0 - i * 2.5))
+
+        ms = make_market(97450.0, 97452.0)
+        # Tiny short position (< base_size=0.001) — effectively flat
+        bs = make_bot(-0.0003)
+        result = engine.generate_quotes(ms, bs)
+
+        # BOTH sides should be blocked (flat + momentum)
+        assert result.bid_size == 0
+        assert result.ask_size == 0
 
     def test_no_momentum_no_filter(self):
         """Flat market should not trigger any filter."""
