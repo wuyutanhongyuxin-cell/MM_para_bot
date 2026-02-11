@@ -904,3 +904,105 @@ class TestSpreadFactor:
         """spread_factor should be read from config."""
         engine = QuoteEngine(make_config(**{"strategy.spread_factor": 0.25}))
         assert engine.spread_factor == 0.25
+
+
+class TestRapidMomentumGuard:
+    """Test rapid momentum micro-guard (10s window flash move detection).
+
+    Ref: Cartea et al. (2015) Ch.10 — inventory risk in fast markets.
+    Live data: $86 drop in 6s caused 6 cascading BUY fills.
+    """
+
+    def _seed_flash_drop(self, engine, drop_amount=50):
+        """Seed prices that simulate a flash drop over ~10 seconds."""
+        t = time.time()
+        base = 97500.0
+        # 60 prices over 10 seconds: first half stable, second half dropping
+        for i in range(30):
+            engine.mid_prices.append((t - 10 + i * 0.2, base))
+        for i in range(30):
+            price = base - (drop_amount * (i + 1) / 30)
+            engine.mid_prices.append((t - 4 + i * 0.13, price))
+
+    def _seed_flash_rally(self, engine, rally_amount=50):
+        """Seed prices that simulate a flash rally over ~10 seconds."""
+        t = time.time()
+        base = 97500.0
+        for i in range(30):
+            engine.mid_prices.append((t - 10 + i * 0.2, base))
+        for i in range(30):
+            price = base + (rally_amount * (i + 1) / 30)
+            engine.mid_prices.append((t - 4 + i * 0.13, price))
+
+    def test_flash_drop_blocks_both_when_flat(self):
+        """Flash drop should block both sides when flat (flat guard)."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 200,  # High so 45s guard doesn't fire
+        }))
+        self._seed_flash_drop(engine, drop_amount=60)
+
+        ms = make_market(97450.0, 97452.0)
+        bs = make_bot(0.0)
+        result = engine.generate_quotes(ms, bs)
+
+        # Flat + rapid momentum → both sides blocked
+        assert result.bid_size == 0
+        assert result.ask_size == 0
+
+    def test_flash_drop_blocks_bid_when_long(self):
+        """Flash drop with long position should block bid (don't add)."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 200,
+        }))
+        self._seed_flash_drop(engine, drop_amount=60)
+
+        ms = make_market(97450.0, 97452.0)
+        bs = make_bot(0.003)  # Long
+        result = engine.generate_quotes(ms, bs)
+
+        # Long + fast drop → bid blocked (don't buy more into drop)
+        assert result.bid_size == 0
+        assert result.ask_size > 0  # Exit side still allowed
+
+    def test_flash_rally_blocks_ask_when_short(self):
+        """Flash rally with short position should block ask (don't add)."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 200,
+        }))
+        self._seed_flash_rally(engine, rally_amount=60)
+
+        ms = make_market(97550.0, 97552.0)
+        bs = make_bot(-0.003)  # Short
+        result = engine.generate_quotes(ms, bs)
+
+        # Short + fast rally → ask blocked (don't sell more into rally)
+        assert result.ask_size == 0
+        assert result.bid_size > 0  # Exit side still allowed
+
+    def test_small_rapid_move_no_block(self):
+        """Small rapid move (< threshold) should not trigger guard."""
+        engine = QuoteEngine(make_config(**{
+            "strategy.momentum_threshold": 200,
+        }))
+        self._seed_flash_drop(engine, drop_amount=15)  # Only $15 < $30 threshold
+
+        ms = make_market(97485.0, 97487.0)
+        bs = make_bot(0.003)
+        result = engine.generate_quotes(ms, bs)
+
+        # Small move → no rapid momentum block
+        assert result.bid_size > 0 or result.ask_size > 0
+
+    def test_calc_rapid_momentum_empty(self):
+        """calc_rapid_momentum should return 0 with insufficient data."""
+        engine = QuoteEngine(make_config())
+        assert engine.calc_rapid_momentum(10) == 0.0
+
+    def test_calc_rapid_momentum_value(self):
+        """calc_rapid_momentum should return price change over window."""
+        engine = QuoteEngine(make_config())
+        t = time.time()
+        engine.mid_prices.append((t - 5, 97500.0))
+        engine.mid_prices.append((t, 97460.0))
+        rapid = engine.calc_rapid_momentum(10)
+        assert rapid == pytest.approx(-40.0)

@@ -760,6 +760,9 @@ class SpreadCaptureBot:
         # Update PnL tracker (for PnL math only, NOT position authority)
         summary = self.pnl_tracker.on_fill(side, price, size)
 
+        # Save pre-fill position for closing-fill detection (Fix A below)
+        pre_fill_pos = self.bot_state.net_position
+
         # Apply immediate position delta from this fill.
         # Before this fix: on_fill() did NOT update position → relied entirely on
         # WS position channel which lags fills → 51% mismatch rate (392/768 fills
@@ -817,10 +820,22 @@ class SpreadCaptureBot:
             self.bot_state.open_ask_id = None
             self.bot_state.open_ask_price = 0.0
 
-        # Fix 3: Signal main_loop to requote immediately after fill + cancel.
-        # Closes the "naked window" — without this, bot waits up to refresh_interval
-        # (3s) with no orders on book: no spread capture, no exit protection.
-        self._fill_event.set()
+        # Fix 3 (revised): Only trigger fill_event for CLOSING fills.
+        # Original: fill_event fired for ALL fills → immediate requote.
+        # Problem: during rapid price drops, entry fills trigger cascading
+        # adverse accumulation. Live data 2025-02-07: 6 BUY fills in 6s
+        # during $86 drop, accumulating 0.00568 BTC long → sold at -$1.02.
+        # Ref: Hendershott, Jones & Menkveld (2011) — MMs pull quotes during
+        # fast moves to avoid adverse selection ("quote pulling" defense).
+        # Fix: only closing fills (position-reducing) trigger immediate requote.
+        # Entry fills keep the natural 3s refresh_interval delay as protection.
+        is_closing_fill = (
+            (side == "BUY" and pre_fill_pos < -self.base_size * 0.5) or
+            (side == "SELL" and pre_fill_pos > self.base_size * 0.5)
+        )
+        if is_closing_fill:
+            self._fill_event.set()
+            log.debug("[FILL-REQUOTE] Closing fill → immediate requote")
 
         # Log — show exchange position (bot_state), not PnLTracker position
         rpnl = summary["realized_pnl"]

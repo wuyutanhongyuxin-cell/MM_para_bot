@@ -271,6 +271,24 @@ class QuoteEngine:
                 return self.mid_prices[-1][1] - price
         return self.mid_prices[-1][1] - self.mid_prices[0][1]
 
+    def calc_rapid_momentum(self, window_sec: float = 10) -> float:
+        """Short-window price change for flash move detection.
+
+        Catches fast price drops/spikes that the main momentum_window (45s)
+        is too slow to detect at per-fill requote speed.
+        Live data: $86 drop in 6s caused 6 cascading BUY fills.
+        Ref: Easley, López de Prado & O'Hara (2012) — VPIN shows short-term
+        price shocks precede major adverse selection events.
+        """
+        if len(self.mid_prices) < 2:
+            return 0.0
+        now_ts = self.mid_prices[-1][0]
+        cutoff = now_ts - window_sec
+        for ts, price in self.mid_prices:
+            if ts >= cutoff:
+                return self.mid_prices[-1][1] - price
+        return self.mid_prices[-1][1] - self.mid_prices[0][1]
+
     def calc_obi(self, bids: list, asks: list) -> float:
         """Calculate EMA-smoothed Order Book Imbalance.
 
@@ -470,6 +488,27 @@ class QuoteEngine:
                     # Downtrend + long: block bid (don't buy into selloff)
                     result.bid_size = 0
                     log.info(f"[MOMENTUM] -${abs(momentum):.0f}/{self.momentum_window}s → bid blocked")
+
+            # 7b2: Rapid momentum micro-guard (10s window)
+            # Catches flash moves that 45s momentum window misses.
+            # Live data: $86 drop in 6s was invisible to 45s window at fill speed.
+            # Threshold: max(30, 1.5×sigma) adapts to current volatility.
+            # Ref: Cartea et al. (2015) Ch.10 — inventory risk in fast markets.
+            rapid_mom = self.calc_rapid_momentum(10)
+            rapid_threshold = max(30, 1.5 * sigma)
+            if abs(rapid_mom) > rapid_threshold:
+                if is_effectively_flat:
+                    result.bid_size = 0
+                    result.ask_size = 0
+                    log.info(f"[RAPID-MOM] ${rapid_mom:+.0f}/10s > ${rapid_threshold:.0f} → both blocked (flat)")
+                elif rapid_mom < 0 and net_pos > 0:
+                    # Fast drop + long: block bid (don't add to losing long)
+                    result.bid_size = 0
+                    log.info(f"[RAPID-MOM] ${rapid_mom:+.0f}/10s → bid blocked (long)")
+                elif rapid_mom > 0 and net_pos < 0:
+                    # Fast rally + short: block ask (don't add to losing short)
+                    result.ask_size = 0
+                    log.info(f"[RAPID-MOM] ${rapid_mom:+.0f}/10s → ask blocked (short)")
 
             # 7c: OBI protective filter — block entries in pressure direction
             if self.obi_enabled and abs(self.obi_smooth) > self.obi_threshold:
