@@ -241,6 +241,13 @@ class SpreadCaptureBot:
         elif not self.bot_state.has_position:
             self.bot_state.position_entry_time = 0
             self.bot_state.tighten_mode = False
+        # Reset entry time on position reversal (sign flip through zero)
+        # Without this, a long→short flip keeps the old entry time,
+        # making inventory timeout fire based on the stale long's age
+        elif (old_pos > 0.0001 and new_pos < -0.0001) or (old_pos < -0.0001 and new_pos > 0.0001):
+            self.bot_state.position_entry_time = time.time()
+            self.bot_state.tighten_mode = False
+            log.info("[POS-REVERSAL] Position sign flipped, reset entry time")
 
     # =========================================================================
     # Main Loop
@@ -626,6 +633,23 @@ class SpreadCaptureBot:
         self.bot_state.avg_entry_price = 0.0
         self.bot_state.unrealized_pnl = 0.0
 
+    async def _cancel_all_on_circuit_break(self):
+        """Cancel all outstanding orders when circuit breaker fires.
+
+        Prevents stale orders on the book from being matched during cooldown,
+        which can reverse position through zero and create unexpected exposure.
+        """
+        if self.bot_state.open_bid_id or self.bot_state.open_ask_id:
+            log.warning("[CIRCUIT BREAKER] Cancelling all open orders to prevent reversal")
+            try:
+                await self.client.cancel_all(self.market_name)
+            except Exception as e:
+                log.error(f"Cancel on circuit break failed: {e}")
+            self.bot_state.open_bid_id = None
+            self.bot_state.open_bid_price = 0.0
+            self.bot_state.open_ask_id = None
+            self.bot_state.open_ask_price = 0.0
+
     # =========================================================================
     # Fill / Order Handling
     # =========================================================================
@@ -665,6 +689,11 @@ class SpreadCaptureBot:
         self.bot_state.realized_pnl_session = summary["cumulative_pnl"]
         if summary["realized_pnl"] != 0:
             self.risk_manager.update_pnl(summary["realized_pnl"])
+
+        # Circuit breaker: cancel all outstanding orders immediately
+        # Prevents stale orders from being filled and reversing position
+        if self.risk_manager.is_circuit_breaker_active():
+            await self._cancel_all_on_circuit_break()
 
         # Clear matched order ID
         if order_id == self.bot_state.open_bid_id:

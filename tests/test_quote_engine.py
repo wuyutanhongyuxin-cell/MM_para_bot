@@ -185,8 +185,8 @@ class TestInventorySkewing:
 class TestOBIProtectiveFilter:
     """Test OBI protective filter (blocks adverse-side entries)."""
 
-    def test_positive_obi_blocks_ask(self):
-        """Positive OBI (buy pressure) should block ask when flat (don't sell into rally)."""
+    def test_positive_obi_blocks_both_when_flat(self):
+        """Positive OBI + flat → flat guard blocks BOTH sides (one-sided = directional bet)."""
         engine = QuoteEngine(make_config())
         seed_prices(engine, [97501.0] * 20)
 
@@ -202,13 +202,12 @@ class TestOBIProtectiveFilter:
         bs = make_bot(0.0)  # Flat
         result = engine.generate_quotes(ms, bs)
 
-        # Ask should be blocked (don't sell into buy pressure)
+        # Flat guard: both sides blocked (one-sided entry when flat = directional bet)
         assert result.ask_size == 0
-        # Bid should still be active
-        assert result.bid_size > 0
+        assert result.bid_size == 0
 
-    def test_negative_obi_blocks_bid(self):
-        """Negative OBI (sell pressure) should block bid when flat (don't buy into selloff)."""
+    def test_negative_obi_blocks_both_when_flat(self):
+        """Negative OBI + flat → flat guard blocks BOTH sides."""
         engine = QuoteEngine(make_config())
         seed_prices(engine, [97501.0] * 20)
 
@@ -224,6 +223,27 @@ class TestOBIProtectiveFilter:
         bs = make_bot(0.0)
         result = engine.generate_quotes(ms, bs)
 
+        # Flat guard: both sides blocked
+        assert result.bid_size == 0
+        assert result.ask_size == 0
+
+    def test_obi_one_sided_when_holding_position(self):
+        """OBI should only block one side when there's a position to protect."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        # Sell pressure: blocks bid for long position (protects from adding)
+        bids = [(97500 - i, 1.0) for i in range(5)]
+        asks = [(97502 + i, 10.0) for i in range(5)]
+        for _ in range(10):
+            engine.calc_obi(bids, asks)
+
+        ms = make_market()
+        bs = make_bot(0.003)  # Long position — NOT flat
+        result = engine.generate_quotes(ms, bs)
+
+        # With position: bid blocked (protect), ask active (exit)
+        # Flat guard does NOT fire because net_pos > 0.0001
         assert result.bid_size == 0
         assert result.ask_size > 0
 
@@ -525,8 +545,8 @@ class TestTightenMode:
 class TestMomentumGuard:
     """Test momentum guard — blocks entries in trend direction."""
 
-    def test_uptrend_blocks_ask(self):
-        """Strong uptrend should block ask (don't sell into rally) when flat."""
+    def test_uptrend_blocks_both_when_flat(self):
+        """Strong uptrend + flat → flat guard blocks BOTH sides (one-sided = directional bet)."""
         engine = QuoteEngine(make_config(**{
             "strategy.momentum_threshold": 30,
             "strategy.momentum_window": 300,
@@ -540,11 +560,12 @@ class TestMomentumGuard:
         bs = make_bot(0.0)  # Flat
         result = engine.generate_quotes(ms, bs)
 
-        assert result.ask_size == 0  # Blocked
-        assert result.bid_size > 0   # Still active
+        # Flat guard: momentum blocked ask → both sides paused
+        assert result.ask_size == 0
+        assert result.bid_size == 0
 
-    def test_downtrend_blocks_bid(self):
-        """Strong downtrend should block bid (don't buy into selloff) when flat."""
+    def test_downtrend_blocks_both_when_flat(self):
+        """Strong downtrend + flat → flat guard blocks BOTH sides."""
         engine = QuoteEngine(make_config(**{
             "strategy.momentum_threshold": 30,
             "strategy.momentum_window": 300,
@@ -557,8 +578,9 @@ class TestMomentumGuard:
         bs = make_bot(0.0)
         result = engine.generate_quotes(ms, bs)
 
+        # Flat guard: momentum blocked bid → both sides paused
         assert result.bid_size == 0
-        assert result.ask_size > 0
+        assert result.ask_size == 0
 
     def test_uptrend_allows_exit_when_long(self):
         """Uptrend should NOT block ask when long (ask = exit/profit-taking)."""

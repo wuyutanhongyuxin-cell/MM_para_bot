@@ -425,6 +425,16 @@ class QuoteEngine:
                     result.bid_size = 0
                     log.info(f"[OBI-GUARD] sell pressure {self.obi_smooth:+.2f} → bid blocked")
 
+            # 7d: Flat guard — one-sided entry when flat = directional bet, NOT market making
+            # A flat market maker must quote BOTH sides (spread capture) or NEITHER.
+            # Ref: Cartea et al. (2015) Ch.10 — protective filters should only be
+            # one-sided when there's an existing position to protect.
+            if abs(net_pos) < 0.0001:  # below min_size 0.0003 = effectively flat
+                if (result.bid_size == 0) != (result.ask_size == 0):
+                    result.bid_size = 0
+                    result.ask_size = 0
+                    log.info("[FLAT-GUARD] Filter blocked one side while flat → both sides paused")
+
         # Enforce minimum size (0.0003 BTC for Paradex)
         # Round UP to min_size (keep dual-sided quoting for spread capture).
         # Only truly zero sizes (from max position or tighten mode) stay at 0.

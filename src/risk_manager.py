@@ -191,6 +191,10 @@ class RiskManager:
         elif realized_pnl > 0:
             self._consecutive_losses = 0
 
+    def is_circuit_breaker_active(self) -> bool:
+        """Check if circuit breaker cooldown is currently active."""
+        return time.time() < self._loss_pause_until
+
     def record_fee(self, notional: float, is_maker: bool = True):
         """Record fee for a fill (maker or taker rate)."""
         rate = self.maker_fee_rate if is_maker else self.taker_fee_rate
