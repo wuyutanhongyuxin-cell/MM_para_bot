@@ -74,6 +74,7 @@ class SpreadCaptureBot:
         self._bbo_event = asyncio.Event()
         self._fill_event = asyncio.Event()  # Fix 3: immediate requote after fill
         self._last_bbo_time = 0.0
+        self._last_fill_time = 0.0  # For reconcile cooldown (avoid race with fill delta)
 
         # Market params from config
         strategy = self.config.get("strategy", {})
@@ -749,6 +750,8 @@ class SpreadCaptureBot:
         if price == 0 or size == 0:
             return
 
+        self._last_fill_time = time.time()
+
         # Determine if maker or taker
         is_maker = fill.get("liquidity", "").upper() == "MAKER"
         fill_type = "maker" if is_maker else "taker"
@@ -861,12 +864,12 @@ class SpreadCaptureBot:
             ask_quote=self.bot_state.open_ask_price,
         )
 
-        # Post-fill forced reconciliation: verify position with REST
-        # Data: 8 mismatches in 19min (7 sign flips) because WS position
-        # updates lag behind fills. Without this, bot quotes wrong direction
-        # for up to 5s (now 2s with reduced interval, but immediate is better).
-        # Cost: 1 GET /positions per fill ≈ 12/min << 120 GET/s limit.
-        await self._reconcile_position()
+        # Removed forced reconcile after fill.
+        # Problem: REST API may not have processed this fill yet → returns stale
+        # position → overwrites our correct fill delta → 15+ mismatches/3min.
+        # Now: fill delta is applied immediately (lines 773-776), WS position SET
+        # arrives 0.1-1s later with correct absolute value, and periodic reconcile
+        # (every 2s) only fires when settled (>2s after any fill).
 
     async def _handle_order_update(self, order: dict):
         """Handle order status changes (POST_ONLY rejection, etc.)."""
@@ -905,7 +908,17 @@ class SpreadCaptureBot:
             self._bbo_event.set()
 
     async def _reconcile_position(self):
-        """Reconcile local position state with REST API."""
+        """Reconcile local position state with REST API.
+
+        Skips reconciliation for 2s after any fill to avoid race condition:
+        REST may not have processed the fill yet → returns stale position
+        → overwrites correct fill delta → wrong direction quoting.
+        The WS position SET (absolute) handles immediate correction.
+        """
+        # Guard: skip if a fill happened recently (REST may be stale)
+        if time.time() - self._last_fill_time < 2.0:
+            log.debug("[RECONCILE] Skipping — recent fill, waiting for REST to settle")
+            return
         try:
             positions = await self.client.get_positions()
             btc_pos = [p for p in positions if p.get("market") == self.market_name]

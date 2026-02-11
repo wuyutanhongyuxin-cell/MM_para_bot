@@ -12,7 +12,7 @@ Volatility: EWMA × Rogers-Satchell on 5-second OHLC candles.
     - 5s candles: accumulate 5-10 BBO ticks (vs 1s→H==L→sigma stuck at min)
     - Rogers & Satchell (1991): ~6x more efficient than close-to-close, handles drift
     - Yang-Zhang (2000): close-to-close fallback when H==L (no intrabar range)
-    - RiskMetrics (1996): EWMA λ=0.94, ~55s half-life at 5s candles
+    - EWMA λ configurable (default 0.94). λ=0.80 → ~22s half-life at 5s candles
 """
 
 import logging
@@ -192,7 +192,10 @@ class QuoteEngine:
         self.obi_depth = obi_cfg.get("depth", 5)
 
         # Volatility engine: EWMA × Rogers-Satchell (replaces naive stddev)
-        self.vol_engine = VolatilityEngine(lambda_=0.94, min_sigma=self.min_sigma)
+        # λ=0.80: half-life ≈ 22s at 5s candles (vs 0.94→81s, too slow for BTC)
+        # Live data: λ=0.94 → sigma stuck at 10-11 for 60s during $100 drop
+        vol_lambda = strategy.get("vol_lambda", 0.94)
+        self.vol_engine = VolatilityEngine(lambda_=vol_lambda, min_sigma=self.min_sigma)
 
         # Enforce: vol_window must hold enough data for momentum and vol_pause
         # calc_momentum() needs momentum_window seconds of data

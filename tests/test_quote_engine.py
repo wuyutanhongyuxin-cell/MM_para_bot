@@ -600,6 +600,54 @@ class TestVolatilityEngine:
         assert ve._candle_low == 97000.0
 
 
+class TestVolLambdaConfigurable:
+    """Test that EWMA lambda is configurable via vol_lambda config key."""
+
+    def test_default_lambda(self):
+        """Without vol_lambda in config, VolatilityEngine should use 0.94."""
+        engine = QuoteEngine(make_config())
+        assert engine.vol_engine.lambda_ == 0.94
+
+    def test_custom_lambda(self):
+        """vol_lambda in config should override default."""
+        engine = QuoteEngine(make_config(**{"strategy.vol_lambda": 0.80}))
+        assert engine.vol_engine.lambda_ == 0.80
+
+    def test_faster_lambda_responds_quicker(self):
+        """Lower lambda (0.80) should respond to volatility spikes faster than 0.94."""
+        # Both engines start with same calm data
+        ve_fast = VolatilityEngine(lambda_=0.80, min_sigma=1.0)
+        ve_slow = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+
+        t = 1000000.0
+        # 3 calm 5s candles ($5 range)
+        for candle_idx in range(3):
+            base = t + candle_idx * 5
+            for ve in (ve_fast, ve_slow):
+                ve.update(97000.0, base)
+                ve.update(97005.0, base + 1.5)
+                ve.update(96995.0, base + 3.0)
+                ve.update(97002.0, base + 4.5)
+
+        # 1 spike 5s candle ($200 range)
+        base = t + 15
+        for ve in (ve_fast, ve_slow):
+            ve.update(97000.0, base)
+            ve.update(97100.0, base + 1.0)
+            ve.update(96900.0, base + 2.5)
+            ve.update(97050.0, base + 4.0)
+
+        # Close spike candle
+        for ve in (ve_fast, ve_slow):
+            ve.update(97000.0, base + 5)
+
+        sigma_fast = ve_fast.get_sigma()
+        sigma_slow = ve_slow.get_sigma()
+
+        # Faster lambda should show higher sigma after spike (more responsive)
+        assert sigma_fast > sigma_slow
+
+
 class TestTightenMode:
     """Test tighten_mode behavior after inventory timeout."""
 

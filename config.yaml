@@ -38,9 +38,12 @@ strategy:
   vol_window: 60                   # 60s数据窗口 (必须>=max(momentum_window,60))
                                    # 修复: 20s时momentum_window=45s和vol_pause的60s窗口被截断
                                    # 内存: 40tick/s × 60s = 2400条 × 16byte = 38KB
-  min_sigma: 10.0                  # 关键修复! 原5.0导致sigma永远=5→kappa失效
-                                   # 10.0让kappa×10=$4开始有贡献
-                                   # 被min_half=$7兜住, 所以下限是$7不是$4
+  min_sigma: 15.0                  # BTC 5s σ基线≈$13 (50%年化), $18 (70%年化)
+                                   # 10.0太低→低波动期spread偏窄→逆选覆盖不足
+                                   # 15.0: kappa×15=$9, 加min_half=$10→half_spread=$10-19
+  vol_lambda: 0.80                 # EWMA衰减: 0.80在5s K线→半衰期≈22s (快速响应)
+                                   # 0.94太慢(半衰期81s)→$100跌幅时sigma 60s才到12
+                                   # 0.80让sigma在3-4根K线(15-20s)内反映市场波动
   momentum_window: 45              # 45s动量窗口
   momentum_threshold: 60           # $60触发 (日志: $25/6s=$250/min趋势, 45s≈$30)
                                    # $60能抓住中等强度趋势, 不会太频繁
