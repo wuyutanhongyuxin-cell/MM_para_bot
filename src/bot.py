@@ -75,6 +75,8 @@ class SpreadCaptureBot:
         self._fill_event = asyncio.Event()  # Fix 3: immediate requote after fill
         self._last_bbo_time = 0.0
         self._last_fill_time = 0.0  # For reconcile cooldown (avoid race with fill delta)
+        self._last_ws_pos_time = 0.0   # When WS position last updated
+        self._last_ws_pos_value = 0.0  # What WS position last reported
 
         # Market params from config
         strategy = self.config.get("strategy", {})
@@ -278,6 +280,8 @@ class SpreadCaptureBot:
             self.bot_state.net_position = 0.0
 
         new_pos = self.bot_state.net_position
+        self._last_ws_pos_time = time.time()
+        self._last_ws_pos_value = new_pos
         if abs(new_pos - old_pos) > 0.00005:
             log.info(f"[POS-WS] {side} {size:.4f} -> net={new_pos:+.4f} (was {old_pos:+.4f})")
 
@@ -766,17 +770,37 @@ class SpreadCaptureBot:
         # Save pre-fill position for closing-fill detection (Fix A below)
         pre_fill_pos = self.bot_state.net_position
 
-        # Apply immediate position delta from this fill.
-        # Before this fix: on_fill() did NOT update position → relied entirely on
-        # WS position channel which lags fills → 51% mismatch rate (392/768 fills
-        # in Log2). Wrong position → wrong inventory skewing → wrong quote direction.
-        # The WS position channel uses SET (absolute), not increment, so when it
-        # arrives later it simply overrides this delta with the correct value.
-        # REST reconciliation (every 2s + after each fill) provides final correction.
+        # Apply immediate position delta from this fill, with double-count guard.
+        #
+        # Race condition: WS position channel (SET, absolute) often arrives BEFORE
+        # the WS fills channel (this callback). When that happens, WS already set
+        # the correct post-fill position, and applying delta here doubles it.
+        # Live data: 35+ RECONCILE mismatches in 29min from this exact pattern:
+        #   [POS-WS] SHORT 0.003 -> net=-0.003   (correct)
+        #   [FILL]   SELL  0.003 -> pos=-0.006    (doubled!)
+        #
+        # Fix: after applying delta, check if it moved position FURTHER from the
+        # last WS-reported value. If WS was recent (<2s) and delta diverges,
+        # revert — WS already includes this fill.
+        pre_delta_pos = self.bot_state.net_position
         if side == "BUY":
             self.bot_state.net_position += size
         elif side == "SELL":
             self.bot_state.net_position -= size
+
+        ws_age = time.time() - self._last_ws_pos_time
+        if ws_age < 2.0:
+            post_delta_pos = self.bot_state.net_position
+            ws_val = self._last_ws_pos_value
+            dist_before = abs(pre_delta_pos - ws_val)
+            dist_after = abs(post_delta_pos - ws_val)
+            if dist_after > dist_before + 0.00001:
+                # Delta moved us further from WS truth → WS already has this fill
+                self.bot_state.net_position = pre_delta_pos
+                log.debug(
+                    f"[FILL] Delta reverted — WS pos ({ws_val:+.4f}) "
+                    f"already includes fill (would be {post_delta_pos:+.4f})"
+                )
 
         self.bot_state.total_trades += 1
         if is_maker:

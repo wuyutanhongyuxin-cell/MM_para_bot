@@ -8,11 +8,12 @@ Core algorithm:
     5. Size skewing based on inventory
     6. Protective filters: vol-pause + momentum guard + OBI filter
 
-Volatility: EWMA × Rogers-Satchell on 5-second OHLC candles.
+Volatility: Asymmetric EWMA × Rogers-Satchell on 5-second OHLC candles.
     - 5s candles: accumulate 5-10 BBO ticks (vs 1s→H==L→sigma stuck at min)
     - Rogers & Satchell (1991): ~6x more efficient than close-to-close, handles drift
     - Yang-Zhang (2000): close-to-close fallback when H==L (no intrabar range)
-    - EWMA λ configurable (default 0.94). λ=0.80 → ~22s half-life at 5s candles
+    - Asymmetric EWMA: λ_up=0.70 (fast spike response), λ_down=0.95 (slow decay)
+      Keeps sigma elevated after vol events → wider spread when filters clear
 """
 
 import logging
@@ -45,6 +46,17 @@ class VolatilityEngine:
         - RiskMetrics (1996): EWMA with λ=0.94 (~11 candles half-life).
           At 5s candles = ~55s half-life, responsive enough for MM.
 
+    Asymmetric EWMA (GJR-GARCH style):
+        - lambda_up (default 0.70): fast response when vol increases.
+          3-4 candles (15-20s) to reflect a spike.
+        - lambda_down (default 0.95): slow decay when vol decreases.
+          Half-life ~100s, keeps sigma elevated ~4x longer after spikes.
+        - Motivation: momentum/vol-pause filters block quoting during
+          volatile periods. With symmetric λ=0.80 (half-life 22s), sigma
+          decays back to min_sigma BEFORE filters clear → bot resumes
+          with tight spread → immediate adverse selection. Slow decay
+          ensures spread stays wide when trading resumes.
+
     Output: dollar-denominated sigma per candle period (used directly in
     spread formula: half_spread = kappa × sigma). The kappa parameter
     absorbs the time-scale factor.
@@ -52,8 +64,11 @@ class VolatilityEngine:
 
     CANDLE_PERIOD = 5  # seconds per candle
 
-    def __init__(self, lambda_: float = 0.94, min_sigma: float = 8.0):
-        self.lambda_ = lambda_
+    def __init__(self, lambda_up: float = 0.70, lambda_down: float = 0.95,
+                 min_sigma: float = 8.0):
+        self.lambda_up = lambda_up
+        self.lambda_down = lambda_down
+        self.lambda_ = lambda_up  # backward compat for tests
         self.min_sigma = min_sigma
         self.ewma_variance: float = 0.0
         self._initialized: bool = False
@@ -132,9 +147,14 @@ class VolatilityEngine:
                 self.ewma_variance = var_estimate
                 self._initialized = True
             else:
+                # Asymmetric EWMA: fast up (react to spikes), slow down (sustain)
+                if var_estimate > self.ewma_variance:
+                    lam = self.lambda_up
+                else:
+                    lam = self.lambda_down
                 self.ewma_variance = (
-                    self.lambda_ * self.ewma_variance
-                    + (1 - self.lambda_) * var_estimate
+                    lam * self.ewma_variance
+                    + (1 - lam) * var_estimate
                 )
 
         self._prev_close = C
@@ -191,11 +211,17 @@ class QuoteEngine:
         self.obi_threshold = obi_cfg.get("threshold", 0.2)
         self.obi_depth = obi_cfg.get("depth", 5)
 
-        # Volatility engine: EWMA × Rogers-Satchell (replaces naive stddev)
-        # λ=0.80: half-life ≈ 22s at 5s candles (vs 0.94→81s, too slow for BTC)
-        # Live data: λ=0.94 → sigma stuck at 10-11 for 60s during $100 drop
-        vol_lambda = strategy.get("vol_lambda", 0.94)
-        self.vol_engine = VolatilityEngine(lambda_=vol_lambda, min_sigma=self.min_sigma)
+        # Volatility engine: Asymmetric EWMA × Rogers-Satchell
+        # Fast up (λ_up=0.70): react to vol spikes in 3-4 candles (15-20s)
+        # Slow down (λ_down=0.95): keep sigma elevated ~100s after spikes
+        # Live data: symmetric λ=0.80 → sigma decays to min_sigma before
+        # momentum filter clears → bot resumes with tight spread → adverse selection
+        vol_lambda_up = strategy.get("vol_lambda_up", strategy.get("vol_lambda", 0.94))
+        vol_lambda_down = strategy.get("vol_lambda_down", strategy.get("vol_lambda", 0.94))
+        self.vol_engine = VolatilityEngine(
+            lambda_up=vol_lambda_up, lambda_down=vol_lambda_down,
+            min_sigma=self.min_sigma
+        )
 
         # Enforce: vol_window must hold enough data for momentum and vol_pause
         # calc_momentum() needs momentum_window seconds of data

@@ -479,7 +479,7 @@ class TestVolatilityEngine:
 
     def test_rs_variance_correctness(self):
         """Verify RS variance formula: v = ln(H/C)·ln(H/O) + ln(L/C)·ln(L/O)."""
-        ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+        ve = VolatilityEngine(lambda_up=0.94, lambda_down=0.94, min_sigma=1.0)
         t = 1000000.0  # Aligned to 5s boundary
         # Create a 5-second candle: O=97000, H=97050, L=96950, C=97010
         ve.update(97000.0, t)       # Open
@@ -500,7 +500,7 @@ class TestVolatilityEngine:
 
     def test_ewma_decay(self):
         """After a volatile candle, sigma should decay toward min with calm candles."""
-        ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+        ve = VolatilityEngine(lambda_up=0.94, lambda_down=0.94, min_sigma=1.0)
         t = 1000000.0  # Aligned to 5s boundary
 
         # 1 volatile 5s candle ($200 range)
@@ -529,7 +529,7 @@ class TestVolatilityEngine:
 
     def test_responds_to_spike(self):
         """Sigma should increase after a volatility spike."""
-        ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+        ve = VolatilityEngine(lambda_up=0.94, lambda_down=0.94, min_sigma=1.0)
         t = 1000000.0  # Aligned to 5s boundary
 
         # Several calm 5s candles first ($5 range)
@@ -559,7 +559,7 @@ class TestVolatilityEngine:
 
     def test_min_sigma_floor(self):
         """Sigma should never go below min_sigma."""
-        ve = VolatilityEngine(lambda_=0.94, min_sigma=8.0)
+        ve = VolatilityEngine(lambda_up=0.94, lambda_down=0.94, min_sigma=8.0)
         t = 1000000.0
 
         # Tiny range 5s candles ($2)
@@ -577,7 +577,7 @@ class TestVolatilityEngine:
 
     def test_cc_fallback_initializes(self):
         """Close-to-close fallback should initialize EWMA when RS cannot."""
-        ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+        ve = VolatilityEngine(lambda_up=0.94, lambda_down=0.94, min_sigma=1.0)
         t = 1000000.0
         # Single-tick 5s candles (H==L) → RS fails, cc fallback used
         ve.update(97000.0, t)           # candle 0: 1 tick, prev_close=0
@@ -589,7 +589,7 @@ class TestVolatilityEngine:
 
     def test_5s_bucketing(self):
         """Timestamps within same 5s window should belong to same candle."""
-        ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+        ve = VolatilityEngine(lambda_up=0.94, lambda_down=0.94, min_sigma=1.0)
         t = 1000000.0  # Exact 5s boundary
         ve.update(97000.0, t)        # t=0s
         ve.update(97010.0, t + 1.0)  # t=1s, same candle
@@ -601,29 +601,40 @@ class TestVolatilityEngine:
 
 
 class TestVolLambdaConfigurable:
-    """Test that EWMA lambda is configurable via vol_lambda config key."""
+    """Test asymmetric EWMA lambda is configurable via config keys."""
 
     def test_default_lambda(self):
-        """Without vol_lambda in config, VolatilityEngine should use 0.94."""
+        """Without vol_lambda_up/down in config, use 0.94 (backward compat)."""
         engine = QuoteEngine(make_config())
-        assert engine.vol_engine.lambda_ == 0.94
+        assert engine.vol_engine.lambda_up == 0.94
+        assert engine.vol_engine.lambda_down == 0.94
 
-    def test_custom_lambda(self):
-        """vol_lambda in config should override default."""
-        engine = QuoteEngine(make_config(**{"strategy.vol_lambda": 0.80}))
-        assert engine.vol_engine.lambda_ == 0.80
+    def test_custom_lambda_up_down(self):
+        """vol_lambda_up and vol_lambda_down in config should override defaults."""
+        engine = QuoteEngine(make_config(
+            **{"strategy.vol_lambda_up": 0.70, "strategy.vol_lambda_down": 0.95}
+        ))
+        assert engine.vol_engine.lambda_up == 0.70
+        assert engine.vol_engine.lambda_down == 0.95
 
-    def test_faster_lambda_responds_quicker(self):
-        """Lower lambda (0.80) should respond to volatility spikes faster than 0.94."""
-        # Both engines start with same calm data
-        ve_fast = VolatilityEngine(lambda_=0.80, min_sigma=1.0)
-        ve_slow = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+    def test_legacy_vol_lambda_fallback(self):
+        """Old vol_lambda key should still work as fallback for both up/down."""
+        engine = QuoteEngine(make_config(**{"strategy.vol_lambda": 0.85}))
+        assert engine.vol_engine.lambda_up == 0.85
+        assert engine.vol_engine.lambda_down == 0.85
+
+    def test_asymmetric_slow_decay(self):
+        """Asymmetric EWMA: sigma should decay slower than symmetric after spike."""
+        # Asymmetric: fast up (0.70), slow down (0.95)
+        ve_asym = VolatilityEngine(lambda_up=0.70, lambda_down=0.95, min_sigma=1.0)
+        # Symmetric: same fast up for comparison
+        ve_sym = VolatilityEngine(lambda_up=0.70, lambda_down=0.70, min_sigma=1.0)
 
         t = 1000000.0
         # 3 calm 5s candles ($5 range)
         for candle_idx in range(3):
             base = t + candle_idx * 5
-            for ve in (ve_fast, ve_slow):
+            for ve in (ve_asym, ve_sym):
                 ve.update(97000.0, base)
                 ve.update(97005.0, base + 1.5)
                 ve.update(96995.0, base + 3.0)
@@ -631,21 +642,26 @@ class TestVolLambdaConfigurable:
 
         # 1 spike 5s candle ($200 range)
         base = t + 15
-        for ve in (ve_fast, ve_slow):
+        for ve in (ve_asym, ve_sym):
             ve.update(97000.0, base)
             ve.update(97100.0, base + 1.0)
             ve.update(96900.0, base + 2.5)
             ve.update(97050.0, base + 4.0)
 
-        # Close spike candle
-        for ve in (ve_fast, ve_slow):
-            ve.update(97000.0, base + 5)
+        # Close spike candle, then 5 calm candles (decay period)
+        for decay_idx in range(6):
+            base_d = t + 20 + decay_idx * 5
+            for ve in (ve_asym, ve_sym):
+                ve.update(97000.0, base_d)
+                ve.update(97003.0, base_d + 1.5)
+                ve.update(96997.0, base_d + 3.0)
+                ve.update(97001.0, base_d + 4.5)
 
-        sigma_fast = ve_fast.get_sigma()
-        sigma_slow = ve_slow.get_sigma()
+        sigma_asym = ve_asym.get_sigma()
+        sigma_sym = ve_sym.get_sigma()
 
-        # Faster lambda should show higher sigma after spike (more responsive)
-        assert sigma_fast > sigma_slow
+        # After decay: asymmetric should retain higher sigma (slower decay)
+        assert sigma_asym > sigma_sym
 
 
 class TestTightenMode:
