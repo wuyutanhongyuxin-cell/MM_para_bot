@@ -1,8 +1,9 @@
 """Tests for QuoteEngine: Avellaneda-Stoikov + OBI overlay."""
 
+import math
 import time
 import pytest
-from src.quote_engine import QuoteEngine
+from src.quote_engine import QuoteEngine, VolatilityEngine
 from src.state import MarketState, BotState
 
 
@@ -332,34 +333,150 @@ class TestNoCrossingBBO:
 
 
 class TestVolatility:
-    """Test volatility calculation."""
+    """Test volatility calculation (EWMA × Rogers-Satchell)."""
 
-    def test_low_volatility(self):
-        """Stable prices should produce min_sigma floor."""
+    def test_no_data_returns_min_sigma(self):
+        """Before any data, vol engine should return min_sigma."""
         engine = QuoteEngine(make_config())
-        seed_prices(engine, [97501.0] * 20)
-
         sigma = engine.calc_volatility()
         assert sigma == 8.0  # min_sigma floor (default)
 
-    def test_high_volatility(self):
-        """Varying prices should produce higher volatility."""
+    def test_stable_prices_returns_min_sigma(self):
+        """Stable prices within 1-second candle should stay at min_sigma."""
         engine = QuoteEngine(make_config())
-        # Oscillating prices
-        seed_prices(engine, [97500 + (i % 2) * 10 for i in range(20)])
-
+        # All prices identical → H==L → candle skipped → min_sigma
+        t = time.time()
+        for i in range(20):
+            engine.vol_engine.update(97501.0, t + i * 0.05)
         sigma = engine.calc_volatility()
-        assert sigma > 1.0
+        assert sigma == 8.0
 
-    def test_insufficient_data_default(self):
-        """With < 10 samples, should return min_sigma default."""
+    def test_volatile_prices_above_min(self):
+        """Oscillating prices across 1-second candles should produce sigma > min."""
+        engine = QuoteEngine(make_config())
+        t = 1000000.0  # Aligned integer timestamp
+        # Create multiple 1-second candles with meaningful OHLC variation
+        # O, H, L, C must all be different for RS to be non-trivial
+        for sec in range(5):
+            engine.vol_engine.update(97000.0, t + sec)          # Open
+            engine.vol_engine.update(97080.0, t + sec + 0.2)    # High
+            engine.vol_engine.update(96920.0, t + sec + 0.5)    # Low (below open)
+            engine.vol_engine.update(97040.0, t + sec + 0.8)    # Close
+        # Close last candle
+        engine.vol_engine.update(97000.0, t + 6)
+        sigma = engine.calc_volatility()
+        assert sigma > 8.0  # Should be well above min_sigma
+
+    def test_insufficient_candles_returns_min(self):
+        """With only 1 candle (not yet closed), should return min_sigma."""
         engine = QuoteEngine(make_config())
         t = time.time()
-        engine.mid_prices.append((t, 97501.0))
-        engine.mid_prices.append((t + 1, 97502.0))
-
+        engine.vol_engine.update(97500.0, t)
+        engine.vol_engine.update(97520.0, t + 0.5)
+        # Still in first candle (same second), not closed yet
         sigma = engine.calc_volatility()
-        assert sigma == 8.0  # min_sigma default
+        assert sigma == 8.0
+
+
+class TestVolatilityEngine:
+    """Direct tests for VolatilityEngine (EWMA × Rogers-Satchell)."""
+
+    def test_rs_variance_correctness(self):
+        """Verify RS variance formula: v = ln(H/C)·ln(H/O) + ln(L/C)·ln(L/O)."""
+        ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+        # Use aligned integer timestamps to avoid bucket misalignment
+        t = 1000000.0
+        # Create a 1-second candle: O=97000, H=97050, L=96950, C=97010
+        ve.update(97000.0, t)       # Open
+        ve.update(97050.0, t + 0.2) # High
+        ve.update(96950.0, t + 0.4) # Low
+        ve.update(97010.0, t + 0.6) # Close
+        # Close candle by starting new second
+        ve.update(97005.0, t + 1.0)
+
+        # Manually compute expected RS variance
+        O, H, L, C = 97000.0, 97050.0, 96950.0, 97010.0
+        expected_rs = (
+            math.log(H / C) * math.log(H / O)
+            + math.log(L / C) * math.log(L / O)
+        )
+        assert expected_rs > 0
+        assert abs(ve.ewma_variance - expected_rs) < 1e-12
+
+    def test_ewma_decay(self):
+        """After a volatile candle, sigma should decay toward min with calm candles."""
+        ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+        t = 1000000.0  # Aligned integer timestamp
+
+        # 1 volatile candle ($200 range)
+        ve.update(97000.0, t)
+        ve.update(97100.0, t + 0.2)
+        ve.update(96900.0, t + 0.5)
+        ve.update(97050.0, t + 0.8)
+
+        # Close and start calm candles ($4 range each)
+        sigma_after_spike = None
+        for sec in range(1, 20):
+            ve.update(97000.0, t + sec)
+            ve.update(97002.0, t + sec + 0.2)
+            ve.update(96998.0, t + sec + 0.5)
+            ve.update(97001.0, t + sec + 0.8)
+            if sec == 1:
+                sigma_after_spike = ve.get_sigma()
+
+        sigma_decayed = ve.get_sigma()
+        # Sigma should have decayed significantly
+        if sigma_after_spike and sigma_after_spike > 1.0:
+            assert sigma_decayed < sigma_after_spike
+
+    def test_responds_to_spike(self):
+        """Sigma should increase after a volatility spike."""
+        ve = VolatilityEngine(lambda_=0.94, min_sigma=1.0)
+        # Use aligned integer timestamps
+        t = 1000000.0
+
+        # Several calm candles first ($5 range)
+        for sec in range(5):
+            ve.update(97000.0, t + sec)
+            ve.update(97005.0, t + sec + 0.3)
+            ve.update(96995.0, t + sec + 0.6)
+            ve.update(97002.0, t + sec + 0.9)
+
+        sigma_calm = ve.get_sigma()
+
+        # Multiple spike candles ($400 range) — λ=0.94 means each contributes 6%,
+        # so need several spike candles for sigma to increase meaningfully
+        for spike_offset in range(3):
+            spike_sec = 6 + spike_offset
+            ve.update(97000.0, t + spike_sec)
+            ve.update(97200.0, t + spike_sec + 0.2)
+            ve.update(96800.0, t + spike_sec + 0.5)
+            ve.update(97050.0, t + spike_sec + 0.8)
+
+        # Close last spike candle
+        ve.update(97000.0, t + 10.0)
+        sigma_spike = ve.get_sigma()
+
+        # With 3 spike candles (6% contribution each ≈ 17% total weight),
+        # sigma should increase noticeably
+        assert sigma_spike > sigma_calm * 1.5
+
+    def test_min_sigma_floor(self):
+        """Sigma should never go below min_sigma."""
+        ve = VolatilityEngine(lambda_=0.94, min_sigma=8.0)
+        t = 1000000.0  # Aligned integer timestamp
+
+        # Tiny range candles ($2)
+        for sec in range(10):
+            ve.update(97000.0, t + sec)
+            ve.update(97001.0, t + sec + 0.2)
+            ve.update(96999.0, t + sec + 0.5)
+            ve.update(97000.0, t + sec + 0.8)
+
+        # Close last candle
+        ve.update(97000.0, t + 11)
+        sigma = ve.get_sigma()
+        assert sigma >= 8.0
 
 
 class TestTightenMode:

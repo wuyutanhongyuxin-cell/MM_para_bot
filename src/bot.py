@@ -298,7 +298,10 @@ class SpreadCaptureBot:
                         self.bot_state.position_entry_time
                     )
                     if inv_status == "emergency_exit":
-                        if not self.bot_state.emergency_exit_in_progress:
+                        # Guard: skip if in progress OR cooldown active (suppress log spam)
+                        now_t = time.time()
+                        if (not self.bot_state.emergency_exit_in_progress
+                                and now_t - self.bot_state.emergency_exit_last_attempt >= 10):
                             log.warning("[EMERGENCY] Inventory timeout exceeded, force closing")
                             await self.emergency_exit()
                         continue
@@ -314,7 +317,9 @@ class SpreadCaptureBot:
                 if self.bot_state.has_position and self.risk_manager.check_unrealized_loss(
                     self.bot_state.unrealized_pnl
                 ):
-                    if not self.bot_state.emergency_exit_in_progress:
+                    now_t = time.time()
+                    if (not self.bot_state.emergency_exit_in_progress
+                            and now_t - self.bot_state.emergency_exit_last_attempt >= 10):
                         log.warning(
                             f"[EMERGENCY] Unrealized loss ${self.bot_state.unrealized_pnl:.4f} "
                             f"exceeds limit, force closing"
@@ -489,6 +494,10 @@ class SpreadCaptureBot:
         Uses REST position (not internal tracking) to avoid reduce_only rejection
         when internal state diverges from exchange. Includes anti-reentrancy and
         price protection via IOC limit order.
+
+        Handles exchange maintenance modes:
+        - CANCEL_ONLY: only cancellations allowed, wait and retry
+        - POST_ONLY: try aggressive POST_ONLY limit order instead of IOC
         """
         # Anti-reentrancy: 10s cooldown between attempts
         now = time.time()
@@ -503,6 +512,19 @@ class SpreadCaptureBot:
         self.bot_state.emergency_exit_last_attempt = now
 
         try:
+            # Check system state before attempting exit
+            sys_state = (await self.client.get_system_state()).lower()
+            if sys_state == "cancel_only":
+                log.warning(
+                    "[EMERGENCY EXIT] Exchange in CANCEL_ONLY mode. "
+                    "Cancelling orders, will retry exit when system recovers."
+                )
+                await self.client.cancel_all(self.market_name)
+                self.bot_state.clear_orders()
+                # Extend cooldown to 30s — don't spam during maintenance
+                self.bot_state.emergency_exit_last_attempt = time.time() + 20
+                return
+
             log.warning("[EMERGENCY EXIT] Cancelling all orders...")
             await self.client.cancel_all(self.market_name)
             self.bot_state.clear_orders()
@@ -513,11 +535,7 @@ class SpreadCaptureBot:
 
             if not btc_pos or abs(float(btc_pos[0].get("size", 0))) < 0.00005:
                 log.info("[EMERGENCY EXIT] No position on exchange, syncing local state")
-                self.bot_state.net_position = 0.0
-                self.bot_state.position_entry_time = 0
-                self.bot_state.tighten_mode = False
-                self.bot_state.avg_entry_price = 0.0
-                self.bot_state.unrealized_pnl = 0.0
+                self._reset_position_state()
                 return
 
             real_size = abs(float(btc_pos[0]["size"]))
@@ -532,33 +550,53 @@ class SpreadCaptureBot:
                 f"Sending {close_side} {real_size:.4f}"
             )
 
-            # IOC limit order with $5 slippage protection
+            # Determine order instruction based on system state
             bbo = await self.client.get_bbo()
-            if bbo:
-                slippage = 5.0
-                if close_side == "SELL":
-                    limit_price = bbo["bid"] - slippage
-                else:
-                    limit_price = bbo["ask"] + slippage
+            result = None
 
-                result = await self.client.place_order(
-                    side=close_side,
-                    price=limit_price,
-                    size=real_size,
-                    instruction="IOC",
-                    order_type="Limit",
-                    reduce_only=True,
-                )
+            if sys_state == "post_only":
+                # POST_ONLY mode: use aggressive POST_ONLY limit at BBO
+                log.warning("[EMERGENCY EXIT] Exchange in POST_ONLY mode, using POST_ONLY limit")
+                if bbo:
+                    if close_side == "SELL":
+                        limit_price = bbo["ask"]  # Place at best ask (aggressive sell)
+                    else:
+                        limit_price = bbo["bid"]  # Place at best bid (aggressive buy)
+                    result = await self.client.place_order(
+                        side=close_side,
+                        price=limit_price,
+                        size=real_size,
+                        instruction="POST_ONLY",
+                        order_type="Limit",
+                        reduce_only=True,
+                    )
             else:
-                # Fallback: market IOC if BBO unavailable
-                result = await self.client.place_order(
-                    side=close_side,
-                    price=0,
-                    size=real_size,
-                    instruction="IOC",
-                    order_type="Market",
-                    reduce_only=True,
-                )
+                # Normal mode: IOC limit with slippage protection
+                if bbo:
+                    slippage = 5.0
+                    if close_side == "SELL":
+                        limit_price = bbo["bid"] - slippage
+                    else:
+                        limit_price = bbo["ask"] + slippage
+
+                    result = await self.client.place_order(
+                        side=close_side,
+                        price=limit_price,
+                        size=real_size,
+                        instruction="IOC",
+                        order_type="Limit",
+                        reduce_only=True,
+                    )
+                else:
+                    # Fallback: market IOC if BBO unavailable
+                    result = await self.client.place_order(
+                        side=close_side,
+                        price=0,
+                        size=real_size,
+                        instruction="IOC",
+                        order_type="Market",
+                        reduce_only=True,
+                    )
 
             if result:
                 self.risk_manager.record_order()
@@ -568,18 +606,25 @@ class SpreadCaptureBot:
                 btc_pos2 = [p for p in positions2 if p.get("market") == self.market_name]
                 if not btc_pos2 or abs(float(btc_pos2[0].get("size", 0))) < 0.00005:
                     log.info("[EMERGENCY EXIT] Position confirmed closed")
-                    self.bot_state.net_position = 0.0
-                    self.bot_state.position_entry_time = 0
-                    self.bot_state.tighten_mode = False
-                    self.bot_state.avg_entry_price = 0.0
-                    self.bot_state.unrealized_pnl = 0.0
+                    self._reset_position_state()
                 else:
                     remaining = abs(float(btc_pos2[0].get("size", 0)))
                     log.error(f"[EMERGENCY EXIT] Position still open: {remaining:.4f} BTC")
             else:
                 log.error("[EMERGENCY EXIT] Failed to send exit order!")
+                if sys_state not in ("ok", "unknown"):
+                    # System degraded — extend cooldown to avoid hammering
+                    self.bot_state.emergency_exit_last_attempt = time.time() + 20
         finally:
             self.bot_state.emergency_exit_in_progress = False
+
+    def _reset_position_state(self):
+        """Reset all position-related state after confirmed close."""
+        self.bot_state.net_position = 0.0
+        self.bot_state.position_entry_time = 0
+        self.bot_state.tighten_mode = False
+        self.bot_state.avg_entry_price = 0.0
+        self.bot_state.unrealized_pnl = 0.0
 
     # =========================================================================
     # Fill / Order Handling

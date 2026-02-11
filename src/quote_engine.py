@@ -1,12 +1,16 @@
 """Quote Engine: Avellaneda-Stoikov + Momentum Guard + OBI Protective Filter.
 
 Core algorithm:
-    1. Fair Price = mid - gamma * net_position * sigma^2
-    2. Half Spread = max(min_spread, spread*0.4 + kappa*sigma)
+    1. Fair Price = mid - gamma * (q/q_max) * sigma^2  (normalized inventory)
+    2. Half Spread = max(min_spread, spread*factor + kappa*sigma)
     3. Bid = fair - half_spread (floor to tick), Ask = fair + half_spread (ceil to tick)
     4. Enforce no-crossing: bid <= best_bid, ask >= best_ask
     5. Size skewing based on inventory
     6. Protective filters: vol-pause + momentum guard + OBI filter
+
+Volatility: EWMA × Rogers-Satchell on 1-second OHLC candles.
+    - Rogers & Satchell (1991): ~6x more efficient than close-to-close, handles drift
+    - RiskMetrics (1996): EWMA λ=0.94, industry standard for financial vol estimation
 """
 
 import logging
@@ -19,6 +23,100 @@ from typing import Optional, Dict
 from .utils import floor_to_tick, ceil_to_tick
 
 log = logging.getLogger("MM-BOT")
+
+
+class VolatilityEngine:
+    """EWMA × Rogers-Satchell volatility estimator on 1-second OHLC candles.
+
+    Academic basis:
+        - Rogers & Satchell (1991): RS variance handles non-zero drift (BTC trends),
+          ~6x more efficient than close-to-close estimator.
+        - RiskMetrics (1996): EWMA with λ=0.94 (~11s half-life) is the industry
+          standard for financial time-series volatility smoothing.
+        - Yang-Zhang (2000) rejected: its overnight-gap component adds noise
+          for 24/7 BTC markets with no session boundaries.
+
+    Output: dollar-denominated sigma per second (same units as spread formula).
+    """
+
+    def __init__(self, lambda_: float = 0.94, min_sigma: float = 8.0):
+        self.lambda_ = lambda_
+        self.min_sigma = min_sigma
+        self.ewma_variance: float = 0.0
+        self._initialized: bool = False
+        # Current 1-second candle
+        self._candle_start: int = 0
+        self._candle_open: float = 0.0
+        self._candle_high: float = 0.0
+        self._candle_low: float = float('inf')
+        self._candle_close: float = 0.0
+        self._candle_count: int = 0
+
+    def update(self, price: float, timestamp: float) -> float:
+        """Feed a mid-price tick. Returns current dollar sigma estimate."""
+        bucket = int(timestamp)
+
+        if self._candle_start == 0:
+            self._init_candle(bucket, price)
+            return self.min_sigma
+
+        if bucket == self._candle_start:
+            self._update_candle(price)
+        else:
+            if self._candle_count >= 2:
+                self._close_candle()
+            self._init_candle(bucket, price)
+
+        return self.get_sigma()
+
+    def _init_candle(self, bucket: int, price: float):
+        self._candle_start = bucket
+        self._candle_open = price
+        self._candle_high = price
+        self._candle_low = price
+        self._candle_close = price
+        self._candle_count = 1
+
+    def _update_candle(self, price: float):
+        self._candle_high = max(self._candle_high, price)
+        self._candle_low = min(self._candle_low, price)
+        self._candle_close = price
+        self._candle_count += 1
+
+    def _close_candle(self):
+        """Close candle → compute RS variance → update EWMA."""
+        O = self._candle_open
+        H = self._candle_high
+        L = self._candle_low
+        C = self._candle_close
+
+        if O <= 0 or H == L:
+            return
+
+        # Rogers-Satchell: v = ln(H/C)·ln(H/O) + ln(L/C)·ln(L/O)
+        ln_hc = math.log(H / C)
+        ln_ho = math.log(H / O)
+        ln_lc = math.log(L / C)
+        ln_lo = math.log(L / O)
+        rs_var = ln_hc * ln_ho + ln_lc * ln_lo
+        rs_var = max(0.0, rs_var)  # Noisy data can yield negative
+
+        if not self._initialized:
+            self.ewma_variance = rs_var
+            self._initialized = True
+        else:
+            self.ewma_variance = (
+                self.lambda_ * self.ewma_variance
+                + (1 - self.lambda_) * rs_var
+            )
+
+    def get_sigma(self) -> float:
+        """Return current dollar sigma (per-second volatility)."""
+        if not self._initialized:
+            return self.min_sigma
+        price = self._candle_close if self._candle_close > 0 else 97000.0
+        sigma = price * math.sqrt(self.ewma_variance)
+        return max(self.min_sigma, sigma)
 
 
 @dataclass
@@ -64,6 +162,9 @@ class QuoteEngine:
         self.obi_threshold = obi_cfg.get("threshold", 0.2)
         self.obi_depth = obi_cfg.get("depth", 5)
 
+        # Volatility engine: EWMA × Rogers-Satchell (replaces naive stddev)
+        self.vol_engine = VolatilityEngine(lambda_=0.94, min_sigma=self.min_sigma)
+
         # State — mid_prices stores (timestamp, price) tuples
         self.mid_prices: deque = deque()
         self.vol_time_window: float = float(self.vol_window)  # seconds
@@ -83,6 +184,8 @@ class QuoteEngine:
             mid = (bid + ask) / 2.0
             now = time.time()
             self.mid_prices.append((now, mid))
+            # Feed volatility engine with every tick
+            self.vol_engine.update(mid, now)
             # Prune entries older than time window
             cutoff = now - self.vol_time_window
             while self.mid_prices and self.mid_prices[0][0] < cutoff:
@@ -95,24 +198,13 @@ class QuoteEngine:
                 self.obi_smooth = self.calc_obi(bids, asks)
 
     def calc_volatility(self) -> float:
-        """Estimate sigma from mid price differences (standard deviation).
+        """Return current dollar sigma from EWMA × Rogers-Satchell engine.
 
-        Uses time-windowed mid prices (default 60 seconds) to avoid
-        noise from ultra-high-frequency BBO updates.
+        The VolatilityEngine builds 1-second OHLC candles from BBO mid prices
+        and computes Rogers-Satchell variance with EWMA smoothing (λ=0.94).
+        This replaces the naive tick-diff stddev which was stuck at min_sigma.
         """
-        if len(self.mid_prices) < 10:
-            return self._last_sigma if self._last_sigma > 0 else self.min_sigma
-
-        prices = [p for _, p in self.mid_prices]
-        diffs = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-
-        if not diffs:
-            return self._last_sigma
-
-        mean = sum(diffs) / len(diffs)
-        variance = sum((d - mean) ** 2 for d in diffs) / len(diffs)
-        sigma = max(self.min_sigma, math.sqrt(variance))
-
+        sigma = self.vol_engine.get_sigma()
         self._last_sigma = sigma
         return sigma
 
@@ -187,9 +279,11 @@ class QuoteEngine:
         result.sigma = sigma
 
         # Step 2: Fair Price with inventory adjustment (Avellaneda-Stoikov)
-        # When long (net_pos > 0), lower fair_price to encourage selling
-        # When short (net_pos < 0), raise fair_price to encourage buying
-        fair_price = mid - self.gamma * net_pos * (sigma ** 2)
+        # Normalize position to [-1, +1] range (GLFT 2013 recommendation)
+        # Old: gamma * net_pos * σ² → $0.04 at typical params (zero ticks)
+        # New: gamma * (q/q_max) * σ² → $1-12 depending on inventory & vol
+        inv_ratio = net_pos / self.max_position if self.max_position > 0 else 0
+        fair_price = mid - self.gamma * inv_ratio * (sigma ** 2)
 
         # Step 3: Record OBI (protective filter applied in Step 7)
         result.obi = self.obi_smooth

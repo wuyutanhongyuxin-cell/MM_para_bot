@@ -93,6 +93,9 @@ class ParadexClient:
         self._ws_callbacks: Dict[str, Callable] = {}
         self._ws_task: Optional[asyncio.Task] = None
 
+        # Persistent HTTP session (aiohttp docs: "Don't create a session per request")
+        self._session: Optional[aiohttp.ClientSession] = None
+
         # Reconnection
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
@@ -101,8 +104,19 @@ class ParadexClient:
     # Initialization & Authentication
     # =========================================================================
 
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        """Return persistent HTTP session, creating if needed."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
+        return self._session
+
     async def connect(self):
         """Initialize SDK, authenticate, and connect WebSocket."""
+        # Step 0: Create persistent HTTP session
+        await self._ensure_session()
+
         # Step 1: Initialize SDK
         if _SDK_AVAILABLE:
             try:
@@ -143,25 +157,23 @@ class ParadexClient:
             try:
                 # Get auth headers from SDK (includes signature)
                 auth_headers = self._paradex.account.auth_headers()
-                async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as session:
-                    url = f"{self.base_url}/auth?token_usage=interactive"
-                    headers = {"Content-Type": "application/json", **auth_headers}
-                    async with session.post(url, headers=headers) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            self._jwt_token = data.get("jwt_token")
-                            self._decode_jwt_expiry()
-                            # Inject interactive JWT into SDK (correct method names)
-                            self._inject_sdk_token(self._jwt_token)
-                            # Patch SDK auth refresh to use interactive forever
-                            self._patch_sdk_interactive_auth()
-                            log.info("Retail auth OK (interactive token, 0% fees)")
-                            return
-                        else:
-                            text = await resp.text()
-                            log.error(f"Interactive auth failed: {resp.status} {text}")
+                session = await self._ensure_session()
+                url = f"{self.base_url}/auth?token_usage=interactive"
+                headers = {"Content-Type": "application/json", **auth_headers}
+                async with session.post(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        self._jwt_token = data.get("jwt_token")
+                        self._decode_jwt_expiry()
+                        # Inject interactive JWT into SDK (correct method names)
+                        self._inject_sdk_token(self._jwt_token)
+                        # Patch SDK auth refresh to use interactive forever
+                        self._patch_sdk_interactive_auth()
+                        log.info("Retail auth OK (interactive token, 0% fees)")
+                        return
+                    else:
+                        text = await resp.text()
+                        log.error(f"Interactive auth failed: {resp.status} {text}")
             except Exception as e:
                 log.error(f"Interactive auth error: {e}")
 
@@ -281,53 +293,47 @@ class ParadexClient:
     # =========================================================================
 
     async def _rest_get(self, path: str, params: dict = None) -> Optional[Dict]:
-        """Generic REST GET."""
+        """Generic REST GET (uses persistent session)."""
         await self._ensure_auth()
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as session:
-                url = f"{self.base_url}{path}"
-                async with session.get(url, headers=self._headers(), params=params) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    text = await resp.text()
-                    log.warning(f"GET {path} failed: {resp.status} {text}")
-                    return None
+            session = await self._ensure_session()
+            url = f"{self.base_url}{path}"
+            async with session.get(url, headers=self._headers(), params=params) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                text = await resp.text()
+                log.warning(f"GET {path} failed: {resp.status} {text}")
+                return None
         except Exception as e:
             log.error(f"GET {path} error: {e}")
             return None
 
     async def _rest_post(self, path: str, data: dict = None) -> Optional[Dict]:
-        """Generic REST POST."""
+        """Generic REST POST (uses persistent session)."""
         await self._ensure_auth()
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as session:
-                url = f"{self.base_url}{path}"
-                async with session.post(
-                    url, headers=self._headers(), json=data or {}
-                ) as resp:
-                    if resp.status in (200, 201):
-                        return await resp.json()
-                    text = await resp.text()
-                    log.warning(f"POST {path} failed: {resp.status} {text}")
-                    return None
+            session = await self._ensure_session()
+            url = f"{self.base_url}{path}"
+            async with session.post(
+                url, headers=self._headers(), json=data or {}
+            ) as resp:
+                if resp.status in (200, 201):
+                    return await resp.json()
+                text = await resp.text()
+                log.warning(f"POST {path} failed: {resp.status} {text}")
+                return None
         except Exception as e:
             log.error(f"POST {path} error: {e}")
             return None
 
     async def _rest_delete(self, path: str) -> bool:
-        """Generic REST DELETE."""
+        """Generic REST DELETE (uses persistent session)."""
         await self._ensure_auth()
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as session:
-                url = f"{self.base_url}{path}"
-                async with session.delete(url, headers=self._headers()) as resp:
-                    return resp.status in (200, 204)
+            session = await self._ensure_session()
+            url = f"{self.base_url}{path}"
+            async with session.delete(url, headers=self._headers()) as resp:
+                return resp.status in (200, 204)
         except Exception as e:
             log.error(f"DELETE {path} error: {e}")
             return False
@@ -558,20 +564,18 @@ class ParadexClient:
             log.info(f"[DRY-RUN] Would batch cancel {len(order_ids)} orders")
             return True
 
-        # Try REST batch cancel
+        # Try REST batch cancel (uses persistent session)
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as session:
-                url = f"{self.base_url}/orders/batch"
-                headers = self._headers()
-                payload = {"order_ids": order_ids}
-                async with session.delete(url, headers=headers, json=payload) as resp:
-                    if resp.status == 200:
-                        log.debug(f"Batch cancelled {len(order_ids)} orders")
-                        return True
-                    text = await resp.text()
-                    log.warning(f"Batch cancel failed: {resp.status} {text}")
+            session = await self._ensure_session()
+            url = f"{self.base_url}/orders/batch"
+            headers = self._headers()
+            payload = {"order_ids": order_ids}
+            async with session.delete(url, headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    log.debug(f"Batch cancelled {len(order_ids)} orders")
+                    return True
+                text = await resp.text()
+                log.warning(f"Batch cancel failed: {resp.status} {text}")
         except Exception as e:
             log.error(f"Batch cancel error: {e}")
 
@@ -733,6 +737,9 @@ class ParadexClient:
 
     async def close(self):
         """Clean up all connections."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
         if self._paradex:
             try:
                 await self._paradex.close()

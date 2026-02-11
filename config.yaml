@@ -17,7 +17,9 @@ strategy:
   # -- 目标: half_spread ≈ $7-12 (full $14-24), 距BBO 4-8层
   # -- 教训: sigma永远卡在min_sigma→half=min_half_spread→必须足够宽
   # -- 日志实证: BTC每秒动$3-5, half<$7会被系统性逆选
-  gamma: 0.12                      # 温和库存惩罚
+  gamma: 0.03                      # 归一化仓位后: 0.03×(q/q_max)×σ²
+                                   # 50%仓位σ=$12: $2.2偏移(2tick), 100%仓位σ=$20: $12(12tick)
+                                   # 学术参考: GLFT 2013, AS 2008 (normalized inventory)
   kappa: 0.40                      # σ>10时开始贡献: 0.4×15=$6, 0.4×20=$8
   spread_factor: 0.30              # 市场spread系数
   min_half_spread: 7.0             # 核心防线! 日志证明$4-5太紧
@@ -42,9 +44,9 @@ strategy:
 obi:
   enabled: true
   alpha: 0.5                       # 快速EMA跟踪orderbook变化
-  threshold: 0.20                  # 日志实证: OBI=-0.23时就应该拦住
-                                   # 20%失衡 = 足够明确的方向性信号
-  depth: 5                         # Top 5 levels
+  threshold: 0.40                  # Cont, Kukanov & Stoikov (2014): |OBI|>0.5时R²≈65%
+                                   # 0.20过敏 → 频繁误阻, 0.40折中学术标准
+  depth: 10                        # 10 levels = 更稳定信号, 减少单大单影响
 
 # ============ Risk Management ============
 risk:
