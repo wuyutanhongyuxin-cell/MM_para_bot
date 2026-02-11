@@ -27,11 +27,17 @@ class RiskManager:
         self.inventory_timeout = risk_cfg.get("inventory_timeout", 120)
         self.emergency_timeout = risk_cfg.get("emergency_timeout", 300)
 
-        # Consecutive loss circuit breaker
+        # Consecutive loss circuit breaker with exponential backoff
+        # Academic: Easley, López de Prado & O'Hara (2012) "Flow Toxicity and
+        # Liquidity in a High-Frequency World" — market makers should increase
+        # retreat duration when toxicity persists. Fixed cooldowns are suboptimal
+        # because they re-enter the same adverse conditions.
         self.consecutive_loss_pause = risk_cfg.get("consecutive_loss_pause", 5)
         self.consecutive_loss_cooldown = risk_cfg.get("consecutive_loss_cooldown", 30)
         self._consecutive_losses: int = 0
         self._loss_pause_until: float = 0.0
+        self._breaker_trigger_count: int = 0  # For exponential backoff
+        self._max_breaker_cooldown: float = 300.0  # Cap at 5 minutes
 
         # Fee tracking (from config, default = Pro rates)
         self.total_fees: float = 0.0
@@ -172,19 +178,42 @@ class RiskManager:
         return unrealized_pnl < -self.max_unrealized_loss
 
     def update_pnl(self, realized_pnl: float):
-        """Update PnL tracking with a realized trade PnL."""
+        """Update PnL tracking with a realized trade PnL.
+
+        Checks:
+            1. Per-trade loss limit (Almgren & Chriss 2000: single-trade stop-loss
+               is the most basic risk control for execution algorithms)
+            2. Consecutive loss circuit breaker with exponential backoff
+        """
         self.hourly_pnl += realized_pnl
         self.daily_pnl += realized_pnl
+
+        # Per-trade loss limit: if a single closing trade exceeds max_loss,
+        # immediately activate circuit breaker. This catches adverse selection
+        # events where one fill leads to catastrophic loss (e.g., buying into
+        # a $170 selloff). Previously this config value was loaded but never checked.
+        if realized_pnl < -self.max_loss_per_trade:
+            self._breaker_trigger_count += 1
+            cooldown = self._calc_breaker_cooldown()
+            self._loss_pause_until = time.time() + cooldown
+            log.warning(
+                f"[PER-TRADE LIMIT] Single trade loss ${realized_pnl:.4f} "
+                f"exceeds -${self.max_loss_per_trade:.2f}, "
+                f"circuit breaker ON ({cooldown:.0f}s)"
+            )
+            self._consecutive_losses = 0
+            return
 
         # Consecutive loss tracking (only count closing trades with nonzero PnL)
         if realized_pnl < 0:
             self._consecutive_losses += 1
             if self._consecutive_losses >= self.consecutive_loss_pause:
-                cooldown = self.consecutive_loss_cooldown
+                self._breaker_trigger_count += 1
+                cooldown = self._calc_breaker_cooldown()
                 self._loss_pause_until = time.time() + cooldown
                 log.warning(
                     f"[CIRCUIT BREAKER] {self._consecutive_losses} consecutive losses, "
-                    f"pausing {cooldown}s"
+                    f"pausing {cooldown:.0f}s (trigger #{self._breaker_trigger_count})"
                 )
                 # Reset counter after triggering — give bot a fresh start after cooldown.
                 # Without reset: counter stays at 5+, every subsequent loss immediately
@@ -192,6 +221,25 @@ class RiskManager:
                 self._consecutive_losses = 0
         elif realized_pnl > 0:
             self._consecutive_losses = 0
+            # Win resets escalation — market conditions improved
+            self._breaker_trigger_count = 0
+
+    def _calc_breaker_cooldown(self) -> float:
+        """Calculate exponential backoff cooldown for circuit breaker.
+
+        1st trigger: base cooldown (60s)
+        2nd trigger: 2x (120s)
+        3rd trigger: 4x (240s)
+        Capped at _max_breaker_cooldown (300s = 5 min).
+
+        Rationale: Easley, López de Prado & O'Hara (2012) show that flow
+        toxicity tends to cluster. Repeated breaker triggers indicate
+        persistent adverse market conditions — escalating retreat time
+        avoids repeated re-entry into toxic flow.
+        """
+        multiplier = 2 ** (self._breaker_trigger_count - 1)
+        return min(self.consecutive_loss_cooldown * multiplier,
+                   self._max_breaker_cooldown)
 
     def is_circuit_breaker_active(self) -> bool:
         """Check if circuit breaker cooldown is currently active."""

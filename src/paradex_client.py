@@ -99,6 +99,11 @@ class ParadexClient:
         # Reconnection
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
+        # Reconnect callback: called after WS reconnect succeeds.
+        # Bot registers this to cancel stale orders + reconcile position.
+        # Hasbrouck & Saar (2013): stale state after disconnect is a
+        # primary operational risk for market makers.
+        self._reconnect_callback: Optional[Callable] = None
 
     # =========================================================================
     # Initialization & Authentication
@@ -653,7 +658,11 @@ class ParadexClient:
             log.error(f"WS connect error: {e}")
 
     async def _ws_reconnect(self):
-        """Reconnect WebSocket with exponential backoff."""
+        """Reconnect WebSocket with exponential backoff.
+
+        After successful reconnect: re-subscribe channels and notify bot
+        via _reconnect_callback so it can cancel stale orders and reconcile.
+        """
         self._ws_connected = False
         log.info(f"WS reconnecting in {self._reconnect_delay:.0f}s...")
         await asyncio.sleep(self._reconnect_delay)
@@ -664,6 +673,12 @@ class ParadexClient:
         # Re-subscribe all channels
         for channel_name, cb in self._ws_callbacks.items():
             await self._subscribe_channel(channel_name, cb)
+        # Notify bot to clean up stale state (cancel orders + reconcile)
+        if self._reconnect_callback:
+            try:
+                await self._reconnect_callback()
+            except Exception as e:
+                log.error(f"Reconnect callback failed: {e}")
 
     async def _subscribe_channel(self, channel_name: str, callback: Callable):
         """Internal: subscribe to a WS channel by name."""

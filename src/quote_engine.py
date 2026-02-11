@@ -335,9 +335,9 @@ class QuoteEngine:
         half_spread = max(self.min_half_spread, spread * self.spread_factor + self.kappa * sigma)
 
         # Widen spread when inventory is heavy
-        inv_ratio = abs(net_pos) / self.max_position if self.max_position > 0 else 0
-        if inv_ratio > 0.5:
-            half_spread *= (1 + inv_ratio)
+        abs_inv_ratio = abs(net_pos) / self.max_position if self.max_position > 0 else 0
+        if abs_inv_ratio > 0.5:
+            half_spread *= (1 + abs_inv_ratio)
 
         result.half_spread = half_spread
 

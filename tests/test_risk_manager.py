@@ -111,23 +111,28 @@ class TestPnLLimits:
     """Test PnL-based trading limits."""
 
     def test_hourly_loss_limit(self):
-        """Should block trading when hourly loss exceeded."""
+        """Should block trading when hourly loss exceeded via multiple small losses."""
         rm = RiskManager(make_config())
-        rm.update_pnl(-0.60)  # Exceeds $0.50 hourly limit
+        # Use small losses that don't trigger per-trade limit ($0.30)
+        # but accumulate to exceed hourly limit ($0.50)
+        rm.update_pnl(-0.20)
+        rm.update_pnl(-0.20)
+        rm.update_pnl(-0.15)  # Total: -$0.55 > hourly limit $0.50
 
         ok, reason = rm.can_trade()
-        # Only check if reason is about loss (time might also block)
         if not ok:
             assert "loss_limit" in reason or "paused_hour" in reason
 
     def test_daily_loss_limit(self):
-        """Should block trading when daily loss exceeded."""
+        """Should block trading when daily loss exceeded via multiple small losses."""
         rm = RiskManager(make_config())
-        rm.update_pnl(-1.10)  # Exceeds $1.00 daily limit
+        # Small losses below per-trade limit but exceeding daily limit ($1.00)
+        for _ in range(5):
+            rm.update_pnl(-0.25)  # Total: -$1.25 > daily limit $1.00
 
         ok, reason = rm.can_trade()
         if not ok:
-            assert "loss_limit" in reason or "paused_hour" in reason
+            assert "loss_limit" in reason or "paused_hour" in reason or "consecutive_loss_cooldown" in reason
 
     def test_pnl_update_accumulates(self):
         """PnL should accumulate across multiple trades."""
@@ -256,6 +261,105 @@ class TestConsecutiveLossBreaker:
         ok, reason = rm.can_trade()
         # Should not be blocked by consecutive_loss_cooldown
         assert "consecutive_loss_cooldown" not in reason
+
+
+class TestPerTradeLossLimit:
+    """Test per-trade loss limit enforcement (was dead code, now active)."""
+
+    def _make_rm(self, max_loss=0.30):
+        cfg = make_config()
+        cfg["risk"]["max_loss_per_trade"] = max_loss
+        cfg["risk"]["consecutive_loss_cooldown"] = 60
+        cfg["schedule"]["active_hours_utc"] = list(range(24))
+        cfg["schedule"]["pause_hours_utc"] = []
+        return RiskManager(cfg)
+
+    def test_large_loss_triggers_breaker(self):
+        """Single trade loss > max_loss_per_trade should trigger circuit breaker."""
+        rm = self._make_rm(max_loss=0.50)
+        rm.update_pnl(-0.80)  # Exceeds $0.50 limit
+        assert rm.is_circuit_breaker_active()
+        ok, reason = rm.can_trade()
+        assert not ok
+        assert "consecutive_loss_cooldown" in reason
+
+    def test_small_loss_no_trigger(self):
+        """Single trade loss within limit should NOT trigger breaker."""
+        rm = self._make_rm(max_loss=0.50)
+        rm.update_pnl(-0.30)
+        assert not rm.is_circuit_breaker_active()
+
+    def test_pnl_still_accumulated_after_per_trade_trigger(self):
+        """Per-trade limit triggers breaker but PnL should still accumulate."""
+        rm = self._make_rm(max_loss=0.50)
+        rm.update_pnl(-0.80)
+        assert rm.hourly_pnl == pytest.approx(-0.80)
+        assert rm.daily_pnl == pytest.approx(-0.80)
+
+
+class TestExponentialBackoff:
+    """Test exponential backoff for circuit breaker cooldown."""
+
+    def _make_rm(self, pause=3, cooldown=60):
+        cfg = make_config()
+        cfg["risk"]["consecutive_loss_pause"] = pause
+        cfg["risk"]["consecutive_loss_cooldown"] = cooldown
+        cfg["schedule"]["active_hours_utc"] = list(range(24))
+        cfg["schedule"]["pause_hours_utc"] = []
+        return RiskManager(cfg)
+
+    def test_first_trigger_base_cooldown(self):
+        """First circuit breaker trigger should use base cooldown."""
+        rm = self._make_rm(pause=3, cooldown=60)
+        for _ in range(3):
+            rm.update_pnl(-0.10)
+        assert rm._breaker_trigger_count == 1
+        # Cooldown should be ~60s (base)
+        remaining = rm._loss_pause_until - time.time()
+        assert 55 < remaining < 65
+
+    def test_second_trigger_doubled(self):
+        """Second trigger should use 2x base cooldown."""
+        rm = self._make_rm(pause=3, cooldown=60)
+        # First trigger
+        for _ in range(3):
+            rm.update_pnl(-0.10)
+        rm._loss_pause_until = time.time() - 1  # Expire
+        # Second trigger
+        for _ in range(3):
+            rm.update_pnl(-0.10)
+        assert rm._breaker_trigger_count == 2
+        remaining = rm._loss_pause_until - time.time()
+        assert 115 < remaining < 125  # ~120s
+
+    def test_backoff_capped(self):
+        """Backoff should be capped at 300s (5 min)."""
+        rm = self._make_rm(pause=3, cooldown=60)
+        # Simulate many triggers
+        rm._breaker_trigger_count = 10
+        cd = rm._calc_breaker_cooldown()
+        assert cd == 300.0  # Capped
+
+    def test_win_resets_escalation(self):
+        """A winning trade should reset the escalation counter."""
+        rm = self._make_rm(pause=3, cooldown=60)
+        # First trigger
+        for _ in range(3):
+            rm.update_pnl(-0.10)
+        assert rm._breaker_trigger_count == 1
+        rm._loss_pause_until = time.time() - 1  # Expire
+        # Win resets escalation
+        rm.update_pnl(0.05)
+        assert rm._breaker_trigger_count == 0
+
+    def test_per_trade_limit_also_escalates(self):
+        """Per-trade limit should also increment the escalation counter."""
+        rm = self._make_rm(pause=5, cooldown=60)
+        rm._make_rm = None  # prevent confusion
+        rm.max_loss_per_trade = 0.30
+        rm.update_pnl(-0.50)  # Exceeds per-trade limit
+        assert rm._breaker_trigger_count == 1
+        assert rm.is_circuit_breaker_active()
 
 
 class TestFeeTracking:

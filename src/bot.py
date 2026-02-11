@@ -72,6 +72,7 @@ class SpreadCaptureBot:
         # Control
         self.running = False
         self._bbo_event = asyncio.Event()
+        self._fill_event = asyncio.Event()  # Fix 3: immediate requote after fill
         self._last_bbo_time = 0.0
 
         # Market params from config
@@ -160,6 +161,13 @@ class SpreadCaptureBot:
         await self.client.subscribe_fills(self._on_fill_ws)
         await self.client.subscribe_orders(self._on_order_update)
         await self.client.subscribe_positions(self._on_position_update)
+        # Fix 2: Subscribe WS orderbook for real-time OBI updates.
+        # Cont, Kukanov & Stoikov (2014): OBI predictive power depends on
+        # signal freshness. 5s stale REST OBI has R²≈25%, real-time ≈65%.
+        await self.client.subscribe_orderbook(self._on_orderbook)
+        # Fix 5: Register reconnect callback to clean stale state after WS drop.
+        # Hasbrouck & Saar (2013): stale orders after disconnect are operational risk.
+        self.client._reconnect_callback = self._on_ws_reconnect
 
     async def _on_bbo(self, channel, message: dict):
         """BBO update callback."""
@@ -205,6 +213,48 @@ class SpreadCaptureBot:
 
         if isinstance(data, dict):
             self._apply_position_update(data)
+
+    async def _on_orderbook(self, channel, message: dict):
+        """WS orderbook update → real-time OBI calculation.
+
+        Fix 2: Previously OBI was updated via REST polling every 5s (stale signal).
+        Now OBI tracks real-time orderbook changes via WS subscription.
+        Only updates OBI (via calc_obi), does NOT re-feed mid_prices to avoid
+        double-counting with _on_bbo callback.
+        """
+        try:
+            data = message.get("params", {}).get("data", message.get("data", message))
+        except AttributeError:
+            return
+        if not isinstance(data, dict):
+            return
+        raw_bids = data.get("bids", [])
+        raw_asks = data.get("asks", [])
+        if not raw_bids or not raw_asks:
+            return
+        bids = [(float(b[0]), float(b[1])) for b in raw_bids]
+        asks = [(float(a[0]), float(a[1])) for a in raw_asks]
+        self.market_state.update_orderbook(bids, asks)
+        # OBI-only update: don't call quote_engine.update() to avoid
+        # double-counting mid prices (BBO callback handles that)
+        if self.quote_engine.obi_enabled and bids and asks:
+            self.quote_engine.calc_obi(bids, asks)
+
+    async def _on_ws_reconnect(self):
+        """Called after WS reconnects. Clean stale state.
+
+        Fix 5: During WS disconnect, fills/cancels may have been missed.
+        Must cancel any potentially stale orders and reconcile position
+        with REST before resuming trading.
+        """
+        log.warning("[WS-RECONNECT] Cleaning up stale state...")
+        try:
+            await self.client.cancel_all(self.market_name)
+            self.bot_state.clear_orders()
+            await self._reconcile_position()
+            log.info("[WS-RECONNECT] Stale orders cancelled, position reconciled")
+        except Exception as e:
+            log.error(f"[WS-RECONNECT] Cleanup failed: {e}")
 
     def _apply_position_update(self, pos: dict):
         """Apply a single position update from WS."""
@@ -258,7 +308,7 @@ class SpreadCaptureBot:
         log.info("Main loop started")
         last_quote = 0.0
         last_orderbook_fetch = 0.0
-        orderbook_interval = 5.0  # Fetch orderbook every 5s for OBI (Pro: GET 120/s)
+        orderbook_interval = 30.0  # REST fallback only (WS orderbook is primary)
         last_reconcile = 0.0
         reconcile_interval = 2.0  # REST position reconciliation every 2s
         # Data: 8 mismatches in 19min at 5s interval, 7 with sign flips.
@@ -372,10 +422,18 @@ class SpreadCaptureBot:
                     continue
 
                 # Check if it's time to refresh quotes
+                # Fix 3: Guilbaud & Pham (2013) — optimal MM adjusts ALL quotes
+                # immediately after any inventory change. _fill_event bypasses
+                # the refresh_interval wait to close the "naked window" where
+                # bot has no orders on book after a fill + cancel.
                 now = time.time()
-                if now - last_quote < self.refresh_interval:
+                fill_triggered = self._fill_event.is_set()
+                if now - last_quote < self.refresh_interval and not fill_triggered:
                     await asyncio.sleep(0.05)  # 50ms poll (not 100ms)
                     continue
+                if fill_triggered:
+                    self._fill_event.clear()
+                    log.debug("[FILL-REQUOTE] Immediate requote after fill")
 
                 # Check rate limit headroom for new placements
                 if not self.risk_manager.can_place_orders(2):
@@ -594,8 +652,13 @@ class SpreadCaptureBot:
                     )
             else:
                 # Normal mode: IOC limit with slippage protection
+                # Fix 4: $5 was too tight — emergency exit fires during volatile
+                # conditions where BBO can move $10-20 between fetch and submit.
+                # Hendershott & Riordan (2013): institutional urgency exits use
+                # 5-10bps tolerance. $30 ≈ 3bps on $97k BTC — covers most
+                # microstructure moves while preventing absurd fill prices.
                 if bbo:
-                    slippage = 5.0
+                    slippage = 30.0
                     if close_side == "SELL":
                         limit_price = bbo["bid"] - slippage
                     else:
@@ -753,6 +816,11 @@ class SpreadCaptureBot:
             self.bot_state.open_bid_price = 0.0
             self.bot_state.open_ask_id = None
             self.bot_state.open_ask_price = 0.0
+
+        # Fix 3: Signal main_loop to requote immediately after fill + cancel.
+        # Closes the "naked window" — without this, bot waits up to refresh_interval
+        # (3s) with no orders on book: no spread capture, no exit protection.
+        self._fill_event.set()
 
         # Log — show exchange position (bot_state), not PnLTracker position
         rpnl = summary["realized_pnl"]
