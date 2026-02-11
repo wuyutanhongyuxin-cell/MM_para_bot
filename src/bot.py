@@ -338,6 +338,17 @@ class SpreadCaptureBot:
                         await self.emergency_exit()
                     continue
 
+                # Circuit breaker + open position: close immediately
+                # 5 consecutive losses = market moving against us
+                # Don't hold through cooldown — flatten and wait
+                if self.bot_state.has_position and self.risk_manager.is_circuit_breaker_active():
+                    now_t = time.time()
+                    if (not self.bot_state.emergency_exit_in_progress
+                            and now_t - self.bot_state.emergency_exit_last_attempt >= 10):
+                        log.warning("[CIRCUIT BREAKER] Position still open during cooldown, force closing")
+                        await self.emergency_exit()
+                    continue
+
                 # ===============================================================
                 # ENTRY CHECKS — block new quotes when risk limits exceeded.
                 # ===============================================================
@@ -638,10 +649,12 @@ class SpreadCaptureBot:
         self.bot_state.unrealized_pnl = 0.0
 
     async def _cancel_all_on_circuit_break(self):
-        """Cancel all outstanding orders when circuit breaker fires.
+        """Cancel all outstanding orders AND close position when circuit breaker fires.
 
-        Prevents stale orders on the book from being matched during cooldown,
-        which can reverse position through zero and create unexpected exposure.
+        5 consecutive losses = market moving against us. Must:
+        1. Cancel all outstanding orders (prevent further fills)
+        2. Close any existing position (stop bleeding during 60s cooldown)
+        Sitting with an open position during cooldown = more losses.
         """
         if self.bot_state.open_bid_id or self.bot_state.open_ask_id:
             log.warning("[CIRCUIT BREAKER] Cancelling all open orders to prevent reversal")
@@ -653,6 +666,11 @@ class SpreadCaptureBot:
             self.bot_state.open_bid_price = 0.0
             self.bot_state.open_ask_id = None
             self.bot_state.open_ask_price = 0.0
+
+        # Close any existing position immediately
+        if self.bot_state.has_position:
+            log.warning("[CIRCUIT BREAKER] Position open during breaker — force closing")
+            await self.emergency_exit()
 
     # =========================================================================
     # Fill / Order Handling
