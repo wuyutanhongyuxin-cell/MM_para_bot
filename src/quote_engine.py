@@ -206,6 +206,14 @@ class QuoteEngine:
             )
             self.vol_window = min_required
 
+        # Warmup: don't quote until vol_engine has real data.
+        # Without warmup, sigma=min_sigma for ~30s → spread too tight during
+        # volatile opens. Live data: $100 drop in 30s with sigma stuck at 10.
+        # Warmup requires: (a) vol_engine initialized, (b) ≥15s of price data.
+        # 15s = 3 candles of 5s, enough for EWMA to have meaningful estimate.
+        self.warmup_seconds = strategy.get("warmup_seconds", 15)
+        self._first_tick_time: float = 0.0
+
         # State — mid_prices stores (timestamp, price) tuples
         self.mid_prices: deque = deque()
         self.vol_time_window: float = float(self.vol_window)  # seconds
@@ -224,6 +232,8 @@ class QuoteEngine:
         if bid > 0 and ask > 0:
             mid = (bid + ask) / 2.0
             now = time.time()
+            if self._first_tick_time == 0.0:
+                self._first_tick_time = now
             self.mid_prices.append((now, mid))
             # Feed volatility engine with every tick
             self.vol_engine.update(mid, now)
@@ -327,6 +337,16 @@ class QuoteEngine:
             result.skip_reason = "invalid_market_data"
             return result
 
+        # Warmup gate: don't quote until we have enough data for sigma estimate.
+        # Without this, sigma=min_sigma for ~30s → spread too tight.
+        # Live bug: bot started during $100/30s drop with sigma=10 → instant losses.
+        # Also skip warmup if holding position (must still quote exit side).
+        if self._first_tick_time > 0 and not bot_state.has_position:
+            elapsed = time.time() - self._first_tick_time
+            if elapsed < self.warmup_seconds:
+                result.skip_reason = f"warmup ({elapsed:.0f}s/{self.warmup_seconds}s)"
+                return result
+
         mid = market_state.mid_price
         best_bid = market_state.best_bid
         best_ask = market_state.best_ask
@@ -421,13 +441,26 @@ class QuoteEngine:
         # When short: keep bid size (buy to reduce), reduce ask size (less selling)
         # When at max position: zero out the adding-to-position side
         if bot_state.tighten_mode and net_pos != 0:
-            # Tighten mode: only exit direction at base_size
+            # Tighten mode: only exit direction, capped to actual position.
+            # BUG FIX: was always base_size → pos=0.0012 sold 0.003 → flipped
+            # to -0.0018 short, creating a NEW losing position from thin air.
+            # Now: min(base_size, abs(pos)) ensures we only close what we have.
+            exit_size = min(self.base_size, abs(net_pos))
+            exit_size = max(exit_size, 0.0003)  # Paradex minimum
+            exit_size = round(exit_size, 5)
             if net_pos > 0:
                 result.bid_size = 0
-                result.ask_size = self.base_size
+                result.ask_size = exit_size
             else:
-                result.bid_size = self.base_size
+                result.bid_size = exit_size
                 result.ask_size = 0
+        elif abs(net_pos) < self.base_size:
+            # Effectively flat: symmetric sizes (treat as zero inventory).
+            # Bug fix: pos=-0.0018 was treated as "short" → bid=0.003, ask=0.0019
+            # → ask filled → position deepened to -0.0037 (wrong direction).
+            # A sub-base_size position has no meaningful directional edge.
+            result.bid_size = self.base_size
+            result.ask_size = self.base_size
         elif net_pos > 0:
             pos_ratio = net_pos / self.max_position if self.max_position > 0 else 1
             # Hard cutoff at 50%: stop adding when half max position reached

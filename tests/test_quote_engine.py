@@ -1006,3 +1006,127 @@ class TestRapidMomentumGuard:
         engine.mid_prices.append((t, 97460.0))
         rapid = engine.calc_rapid_momentum(10)
         assert rapid == pytest.approx(-40.0)
+
+
+class TestTightenModeOvershoot:
+    """Test tighten mode caps exit size to actual position (no overshoot)."""
+
+    def test_tighten_long_small_position(self):
+        """Tighten with pos=0.0012 should sell 0.0012, not base_size=0.001."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(0.0005)  # Less than base_size 0.001
+        bs.tighten_mode = True
+
+        result = engine.generate_quotes(ms, bs)
+        assert result.ask_size == 0.0005  # Capped to actual position
+        assert result.bid_size == 0
+
+    def test_tighten_short_small_position(self):
+        """Tighten with pos=-0.0005 should buy 0.0005, not base_size."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(-0.0005)
+        bs.tighten_mode = True
+
+        result = engine.generate_quotes(ms, bs)
+        assert result.bid_size == 0.0005
+        assert result.ask_size == 0
+
+    def test_tighten_full_position_uses_base_size(self):
+        """Tighten with pos >= base_size should still use base_size."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(0.005)  # > base_size
+        bs.tighten_mode = True
+
+        result = engine.generate_quotes(ms, bs)
+        assert result.ask_size == 0.001  # base_size
+        assert result.bid_size == 0
+
+
+class TestWarmup:
+    """Test warmup period skips quoting until vol engine has data."""
+
+    def test_warmup_skips_when_no_data(self):
+        """Should skip quoting during warmup period."""
+        engine = QuoteEngine(make_config(**{"strategy.warmup_seconds": 15}))
+        # Simulate just-started: first tick just now
+        engine._first_tick_time = time.time()
+        seed_prices(engine, [97501.0] * 5)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(0.0)  # No position
+        result = engine.generate_quotes(ms, bs)
+
+        assert "warmup" in result.skip_reason
+
+    def test_warmup_allows_after_elapsed(self):
+        """Should allow quoting after warmup period."""
+        engine = QuoteEngine(make_config(**{"strategy.warmup_seconds": 15}))
+        engine._first_tick_time = time.time() - 20  # 20s ago
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(0.0)
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.skip_reason == ""
+        assert result.bid_size > 0
+
+    def test_warmup_skipped_if_holding_position(self):
+        """Should NOT skip during warmup if holding a position (must exit)."""
+        engine = QuoteEngine(make_config(**{"strategy.warmup_seconds": 15}))
+        engine._first_tick_time = time.time()  # Just started
+        seed_prices(engine, [97501.0] * 5)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(0.003)  # Holding position
+        result = engine.generate_quotes(ms, bs)
+
+        # Must still quote (exit side) even during warmup
+        assert result.skip_reason == ""
+
+
+class TestEffectivelyFlatSizing:
+    """Test symmetric sizing when position < base_size."""
+
+    def test_near_flat_symmetric_sizes(self):
+        """Position smaller than base_size should get equal bid/ask sizes."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(0.0005)  # < base_size 0.001
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.bid_size == result.ask_size  # Symmetric
+
+    def test_negative_near_flat_symmetric(self):
+        """Negative near-flat position should also be symmetric."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(-0.0005)  # < base_size
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.bid_size == result.ask_size
+
+    def test_meaningful_position_still_skewed(self):
+        """Position >= base_size should still get skewed sizes."""
+        engine = QuoteEngine(make_config())
+        seed_prices(engine, [97501.0] * 20)
+
+        ms = make_market(97500.0, 97502.0)
+        bs = make_bot(0.005)  # 50% of max → bid should be 0
+        result = engine.generate_quotes(ms, bs)
+
+        assert result.bid_size == 0
+        assert result.ask_size > 0
