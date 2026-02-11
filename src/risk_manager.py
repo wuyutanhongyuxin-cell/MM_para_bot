@@ -181,13 +181,15 @@ class RiskManager:
             self._consecutive_losses += 1
             if self._consecutive_losses >= self.consecutive_loss_pause:
                 cooldown = self.consecutive_loss_cooldown
-                if self._consecutive_losses >= self.consecutive_loss_pause * 2:
-                    cooldown *= 10  # 10x cooldown for double the threshold
                 self._loss_pause_until = time.time() + cooldown
                 log.warning(
                     f"[CIRCUIT BREAKER] {self._consecutive_losses} consecutive losses, "
                     f"pausing {cooldown}s"
                 )
+                # Reset counter after triggering — give bot a fresh start after cooldown.
+                # Without reset: counter stays at 5+, every subsequent loss immediately
+                # re-triggers breaker, creating a death spiral where bot can barely trade.
+                self._consecutive_losses = 0
         elif realized_pnl > 0:
             self._consecutive_losses = 0
 

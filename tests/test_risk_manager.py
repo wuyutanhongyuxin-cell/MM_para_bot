@@ -208,11 +208,12 @@ class TestConsecutiveLossBreaker:
         assert rm._loss_pause_until == 0.0
 
     def test_breaker_triggers_at_threshold(self):
-        """Should trigger cooldown at exactly N consecutive losses."""
+        """Should trigger cooldown at exactly N consecutive losses, then reset counter."""
         rm = self._make_rm(pause=3, cooldown=10)
         for _ in range(3):
             rm.update_pnl(-0.10)
-        assert rm._consecutive_losses == 3
+        # Counter resets after breaker fires (prevents death spiral)
+        assert rm._consecutive_losses == 0
         assert rm._loss_pause_until > time.time()
         ok, reason = rm.can_trade()
         assert not ok
@@ -227,13 +228,23 @@ class TestConsecutiveLossBreaker:
         rm.update_pnl(0.05)
         assert rm._consecutive_losses == 0
 
-    def test_double_threshold_10x_cooldown(self):
-        """Double the threshold should trigger 10x cooldown."""
-        rm = self._make_rm(pause=3, cooldown=10)
-        for _ in range(6):  # 2x threshold
+    def test_breaker_resets_allows_fresh_start(self):
+        """After breaker fires and cooldown expires, bot gets a fresh 5-loss allowance."""
+        rm = self._make_rm(pause=3, cooldown=1)
+        # First trigger: 3 losses
+        for _ in range(3):
             rm.update_pnl(-0.10)
-        # Should have 10x cooldown = 100s
-        assert rm._loss_pause_until > time.time() + 90
+        assert rm._loss_pause_until > time.time()
+        assert rm._consecutive_losses == 0  # Reset after trigger
+        # Expire cooldown
+        rm._loss_pause_until = time.time() - 1
+        # Bot can trade again, and needs 3 fresh losses to re-trigger
+        rm.update_pnl(-0.10)
+        assert rm._consecutive_losses == 1  # Fresh count
+        rm.update_pnl(-0.10)
+        assert rm._consecutive_losses == 2
+        ok, _ = rm.can_trade()
+        assert ok  # Not yet at threshold
 
     def test_cooldown_expires(self):
         """After cooldown expires, trading should resume."""
